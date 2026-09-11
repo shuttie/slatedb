@@ -78,11 +78,13 @@ pub(crate) async fn read_sst_for_keys(
     let handle = &view.sst;
 
     // Step 1: load the SST index and filters once for the whole batch.
+    // They use `cache_metadata`, like the single-key path, so
+    // `ReadOptions::cache_blocks` controls only data blocks.
     let index = table_store
-        .read_index(handle, options.cache_blocks, options.segment.clone())
+        .read_index(handle, options.cache_metadata, options.segment.clone())
         .await?;
     let filters = table_store
-        .read_filters(handle, options.cache_blocks, options.segment.clone())
+        .read_filters(handle, options.cache_metadata, options.segment.clone())
         .await?;
     if index.borrow().block_meta().is_empty() {
         return Ok(Vec::new());
