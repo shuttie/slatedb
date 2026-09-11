@@ -8,7 +8,7 @@ import {
   DbReaderBuilder,
   ErrorData,
   FlushType,
-  SsTableId,
+  ReaderMode,
   WriteBatch,
 } from "../index.js";
 import {
@@ -139,15 +139,28 @@ test("reader scan variants", async (t) => {
     ["first", "second", "third"],
   );
 
-  const prefixScan = cleanup.track(await reader.scan_prefix(bytes("item:")));
+  const prefixScan = cleanup.track(await reader.scan_prefix(bytes("item:"), fullRange()));
   requireRows(
     await drainIterator(prefixScan),
     ["item:01", "item:02", "item:03"],
     ["first", "second", "third"],
   );
 
+  const boundedPrefixScan = cleanup.track(await reader.scan_prefix(bytes("item:"), {
+    start: bytes("02"),
+    start_inclusive: false,
+    end: bytes("03"),
+    end_inclusive: true,
+  }));
+  requireRows(
+    await drainIterator(boundedPrefixScan),
+    ["item:03"],
+    ["third"],
+  );
+
   const prefixScanWithOptions = cleanup.track(await reader.scan_prefix_with_options(
     bytes("item:"),
+    fullRange(),
     scanOptions(32, false, 1),
   ));
   requireRows(
@@ -307,13 +320,13 @@ test("reader builder validation and errors", async (t) => {
 
   const invalidBuilder = cleanup.track(new DbReaderBuilder(TEST_DB_PATH, store), { shutdown: false });
   const invalidCheckpointError = await expectInvalid(
-    () => invalidBuilder.with_checkpoint_id("not-a-uuid"),
+    () => invalidBuilder.with_reader_mode(ReaderMode.Checkpoint("not-a-uuid")),
   );
   assert.match(invalidCheckpointError.message, /^invalid checkpoint_id UUID:/);
 
   const missingCheckpointId = "ffffffff-ffff-ffff-ffff-ffffffffffff";
   const missingBuilder = cleanup.track(new DbReaderBuilder(TEST_DB_PATH, store), { shutdown: false });
-  missingBuilder.with_checkpoint_id(missingCheckpointId);
+  missingBuilder.with_reader_mode(ReaderMode.Checkpoint(missingCheckpointId));
   const missingCheckpointError = await expectError(
     () => missingBuilder.build(),
     ErrorData,
@@ -416,7 +429,9 @@ test("reader warm_sst and evict_cached_sst", async (t) => {
   ]);
 
   // Unknown SST is a no-op, not an error.
-  await reader.warm_sst(SsTableId.Wal(999_999n), [CacheTarget.Index()]);
+  await reader.warm_sst({ value: "01ARZ3NDEKTSV4RRFFQ69G5FAV" }, [
+    CacheTarget.Index(),
+  ]);
 
   await reader.evict_cached_sst(sstId);
 });

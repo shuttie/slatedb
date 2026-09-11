@@ -46,6 +46,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "rescaling"
+path = "src/rescaling.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "range-scans"
 path = "src/range_scans.rs"
 test = false
@@ -99,12 +105,32 @@ path = "src/standalone_compactor.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "standalone-garbage-collector"
+path = "src/standalone_garbage_collector.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "read_tracing"
+path = "src/read_tracing.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "write-runtime"
+path = "src/write_runtime.rs"
+test = false
+bench = false
+
 [dependencies]
 anyhow.workspace = true
 object_store = { workspace = true, features = ["azure", "gcp"] }
 slatedb.workspace = true
 tokio = { workspace = true, features = ["macros", "signal"] }
 tracing-subscriber.workspace = true
+tracing-chrome = "0.7.2"
+tracing = "0.1.44"
 
 [lints]
 workspace = true

@@ -194,11 +194,7 @@ impl FsCacheStorage {
 
 #[async_trait::async_trait]
 impl LocalCacheStorage for FsCacheStorage {
-    fn entry(
-        &self,
-        location: &object_store::path::Path,
-        part_size: usize,
-    ) -> Box<dyn LocalCacheEntry> {
+    fn entry(&self, location: &Path, part_size: usize) -> Box<dyn LocalCacheEntry> {
         Box::new(FsCacheEntry {
             root_folder: self.root_folder.clone(),
             location: location.clone(),
@@ -270,7 +266,13 @@ impl FsCacheEntry {
                 .open(tmp_path)
                 .map_err(wrap_io_err)?;
             file.write_all(&buf).map_err(wrap_io_err)?;
-            file.sync_all().map_err(wrap_io_err)?;
+
+            // Note: There is no fsync before the rename. The cache holds copies
+            // of durable upstream bytes, so part durability is not required, only
+            // correctness. The tmp file plus atomic rename means a reader never
+            // observes a partially written part. If a crash leaves a renamed but
+            // not yet flushed part that reads back corrupt, block validation
+            // fails on read, the retried GET will override the cached entry.
             std::fs::rename(tmp_path, path).map_err(wrap_io_err)
         })
         .await?
@@ -893,8 +895,8 @@ impl FsCacheEvictorInner {
             if self.cache_size_bytes.load(Ordering::Relaxed) > target_size {
                 warn!(
                     "cache_size_bytes still exceeds max_cache_size_bytes but no more entries can be evicted(cache_size_bytes={}, max_cache_size_bytes={})",
-                    self.cache_size_bytes.load(Ordering::Relaxed),
-                    self.max_cache_size_bytes
+                    format_bytes_si(self.cache_size_bytes.load(Ordering::Relaxed)),
+                    format_bytes_si(self.max_cache_size_bytes as u64)
                 );
             }
             return 0;
@@ -1067,7 +1069,7 @@ impl FsCacheEvictorInner {
     // a specific index. Returns None if no available index exists.
     fn pick_random_available_index(
         &self,
-        rng: &mut impl rand::Rng,
+        rng: &mut impl Rng,
         keys: &[std::path::PathBuf],
         picked: &HashSet<usize>,
         exclude_idx: Option<usize>,
@@ -1149,6 +1151,7 @@ async fn delete_cache_entry(
 
                 deleted_entries
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
             Err(e) => {
                 error!("FS cache failed to read_dir {path:?}: {e:?}");
                 vec![]
@@ -1190,7 +1193,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
 
         let evictor = FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
@@ -1218,7 +1221,7 @@ mod tests {
             .await;
         assert_eq!(evicted, 2048);
 
-        let file_paths = walkdir::WalkDir::new(temp_dir.path())
+        let file_paths = WalkDir::new(temp_dir.path())
             .into_iter()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -1231,7 +1234,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_backpressure_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
 
         let evictor = FsCacheEvictor::new(
             temp_dir.path().to_path_buf(),
@@ -1268,7 +1271,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let evictor = Arc::new(FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
             1024 * 2,
@@ -1299,7 +1302,7 @@ mod tests {
             .prefix("objstore_cache_test_evictor_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
 
         let evictor = Arc::new(FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
@@ -1351,7 +1354,7 @@ mod tests {
             .prefix("objstore_cache_test_pick_")
             .tempdir()
             .unwrap();
-        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let recorder = MetricsRecorderHelper::noop();
         let evictor = FsCacheEvictorInner::new(
             temp_dir.path().to_path_buf(),
             1024,

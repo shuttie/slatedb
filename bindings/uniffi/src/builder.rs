@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::admin::Admin;
-use crate::config::{ReaderOptions, SstBlockSize};
+use crate::config::{ReaderMode, ReaderOptions, SstBlockSize};
 use crate::db::Db;
 use crate::db_cache::DbCache;
 use crate::db_reader::DbReader;
@@ -12,11 +12,11 @@ use crate::filter_policy::{
 use crate::merge_operator::{adapt_merge_operator, MergeOperator};
 use crate::metrics::adapt_metrics_recorder;
 use crate::object_store::ObjectStore;
+use crate::runtime;
 use crate::settings::Settings;
 use crate::types::{CloneSourceSpec, KeyRange};
 use crate::MetricsRecorder;
 use parking_lot::Mutex;
-use uuid::Uuid;
 
 /// Builder for opening a writable [`crate::Db`].
 ///
@@ -72,9 +72,11 @@ impl DbBuilder {
             .map_err(Into::into)
     }
 
-    /// Sets DB cache.
-    pub fn with_db_cache(&self, db_cache: Arc<DbCache>) -> Result<(), Error> {
-        self.update_builder(|builder| builder.with_db_cache(db_cache.inner.clone()))
+    /// Sets DB cache. `db_cache_id` isolates this database's entries from any other
+    /// `Db`/`DbReader` sharing the same cache; the caller is responsible for its
+    /// uniqueness and stability across reopens.
+    pub fn with_db_cache(&self, db_cache: Arc<DbCache>, db_cache_id: u64) -> Result<(), Error> {
+        self.update_builder(|builder| builder.with_db_cache(db_cache.inner.clone(), db_cache_id))
             .map_err(Into::into)
     }
 
@@ -123,7 +125,10 @@ impl DbBuilder {
     /// Sets the segment extractor (RFC-0024). When configured, every write is
     /// routed through the extractor and the database tracks per-segment LSM
     /// state. The extractor must be configured at database creation time and
-    /// cannot be changed thereafter.
+    /// remain configured thereafter. Its name must remain stable; its
+    /// implementation may evolve only if it preserves routing for all existing
+    /// key schemas and keeps segment prefixes across schema versions an
+    /// antichain (no prefix may be a proper prefix of another).
     pub fn with_segment_extractor(&self, extractor: Arc<dyn PrefixExtractor>) -> Result<(), Error> {
         self.update_builder(|builder| {
             builder.with_segment_extractor(adapt_prefix_extractor(extractor))
@@ -137,7 +142,7 @@ impl DbBuilder {
     /// Opens the database and consumes this builder.
     pub async fn build(&self) -> Result<Arc<Db>, Error> {
         let builder = self.take_builder()?;
-        let db = builder.build().await?;
+        let db = runtime::enter(async move { builder.build().await.map_err(Error::from) }).await?;
         Ok(Arc::new(Db::new(db)))
     }
 }
@@ -180,17 +185,30 @@ impl DbReaderBuilder {
         })
     }
 
-    /// Pins the reader to an existing checkpoint UUID string.
-    pub fn with_checkpoint_id(&self, checkpoint_id: String) -> Result<(), Error> {
-        let checkpoint_id = Uuid::parse_str(&checkpoint_id)
-            .map_err(|source| SlateDbError::InvalidCheckpointId { source })?;
-        self.update_builder(|builder| builder.with_checkpoint_id(checkpoint_id))
+    /// Sets how the reader chooses and refreshes database state.
+    pub fn with_reader_mode(&self, mode: ReaderMode) -> Result<(), Error> {
+        let mode = mode.try_into()?;
+        self.update_builder(|builder| builder.with_reader_mode(mode))
             .map_err(Into::into)
     }
 
     /// Uses a separate object store for WAL files.
     pub fn with_wal_object_store(&self, wal_object_store: Arc<ObjectStore>) -> Result<(), Error> {
         self.update_builder(|builder| builder.with_wal_object_store(wal_object_store.inner.clone()))
+            .map_err(Into::into)
+    }
+
+    /// Disables the SST block and metadata cache.
+    pub fn with_db_cache_disabled(&self) -> Result<(), Error> {
+        self.update_builder(slatedb::DbReaderBuilder::with_db_cache_disabled)
+            .map_err(Into::into)
+    }
+
+    /// Sets DB cache. `db_cache_id` isolates this reader's entries from any other
+    /// `Db`/`DbReader` sharing the same cache; the caller is responsible for its
+    /// uniqueness and stability across reopens.
+    pub fn with_db_cache(&self, db_cache: Arc<DbCache>, db_cache_id: u64) -> Result<(), Error> {
+        self.update_builder(|builder| builder.with_db_cache(db_cache.inner.clone(), db_cache_id))
             .map_err(Into::into)
     }
 
@@ -247,7 +265,8 @@ impl DbReaderBuilder {
     /// Opens the reader and consumes this builder.
     pub async fn build(&self) -> Result<Arc<DbReader>, Error> {
         let builder = self.take_builder()?;
-        let reader = builder.build().await?;
+        let reader =
+            runtime::enter(async move { builder.build().await.map_err(Error::from) }).await?;
         Ok(Arc::new(DbReader::new(reader)))
     }
 }

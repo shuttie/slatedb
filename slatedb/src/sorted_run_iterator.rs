@@ -248,15 +248,16 @@ impl RowEntryIterator for SortedRunIterator<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_cache_policy::BlockCachePolicy;
     use crate::bytes_generator::OrderedBytesGenerator;
     use crate::db_state::{SsTableHandle, SsTableId};
     use crate::format::sst::SsTableFormat;
     use crate::proptest_util;
     use crate::proptest_util::sample;
+    use crate::tablestore::TableStoreKind;
     use crate::test_utils::assert_kv;
     use crate::types::KeyValue;
 
-    use crate::object_stores::ObjectStores;
     use bytes::{BufMut, BytesMut};
     use object_store::path::Path;
     use object_store::{memory::InMemory, ObjectStore};
@@ -275,10 +276,12 @@ mod tests {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store, None),
+            object_store,
             format,
             root_path.clone(),
             None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let mut builder = table_store.table_builder();
         builder
@@ -294,12 +297,12 @@ mod tests {
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
-        let id = SsTableId::Compacted(ulid::Ulid::new());
-        let handle = table_store.write_sst(&id, &encoded, false).await.unwrap();
-        let sr = SortedRun {
-            id: 0,
-            sst_views: vec![SsTableView::identity(handle)],
-        };
+        let id = SsTableId::from(ulid::Ulid::new());
+        let handle = table_store
+            .write_sst(&id, &encoded, Some(Bytes::new()))
+            .await
+            .unwrap();
+        let sr = SortedRun::new(0, [SsTableView::identity(handle)]);
 
         let mut iter = SortedRunIterator::new_owned_initialized(
             ..,
@@ -332,10 +335,12 @@ mod tests {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store, None),
+            object_store,
             format,
             root_path.clone(),
             None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let mut builder = table_store.table_builder();
         builder
@@ -347,23 +352,29 @@ mod tests {
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
-        let id1 = SsTableId::Compacted(ulid::Ulid::new());
-        let handle1 = table_store.write_sst(&id1, &encoded, false).await.unwrap();
+        let id1 = SsTableId::from(ulid::Ulid::new());
+        let handle1 = table_store
+            .write_sst(&id1, &encoded, Some(Bytes::new()))
+            .await
+            .unwrap();
         let mut builder = table_store.table_builder();
         builder
             .add_value(b"key3", b"value3", Some(3), None)
             .await
             .unwrap();
         let encoded = builder.build().await.unwrap();
-        let id2 = SsTableId::Compacted(ulid::Ulid::new());
-        let handle2 = table_store.write_sst(&id2, &encoded, false).await.unwrap();
-        let sr = SortedRun {
-            id: 0,
-            sst_views: vec![
+        let id2 = SsTableId::from(ulid::Ulid::new());
+        let handle2 = table_store
+            .write_sst(&id2, &encoded, Some(Bytes::new()))
+            .await
+            .unwrap();
+        let sr = SortedRun::new(
+            0,
+            [
                 SsTableView::identity(handle1),
                 SsTableView::identity(handle2),
             ],
-        };
+        );
 
         let mut iter = SortedRunIterator::new_owned_initialized(
             ..,
@@ -398,10 +409,12 @@ mod tests {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store, None),
+            object_store,
             format,
             root_path.clone(),
             None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let mut builder = table_store.table_builder();
         for i in 1..=4 {
@@ -413,8 +426,11 @@ mod tests {
                 .unwrap();
         }
         let encoded = builder.build().await.unwrap();
-        let id1 = SsTableId::Compacted(ulid::Ulid::new());
-        let handle1 = table_store.write_sst(&id1, &encoded, false).await.unwrap();
+        let id1 = SsTableId::from(ulid::Ulid::new());
+        let handle1 = table_store
+            .write_sst(&id1, &encoded, Some(Bytes::new()))
+            .await
+            .unwrap();
         let mut builder = table_store.table_builder();
         for i in 5..=8 {
             let key = format!("key{i}");
@@ -425,11 +441,14 @@ mod tests {
                 .unwrap();
         }
         let encoded = builder.build().await.unwrap();
-        let id2 = SsTableId::Compacted(ulid::Ulid::new());
-        let handle2 = table_store.write_sst(&id2, &encoded, false).await.unwrap();
-        let sr = SortedRun {
-            id: 0,
-            sst_views: vec![
+        let id2 = SsTableId::from(ulid::Ulid::new());
+        let handle2 = table_store
+            .write_sst(&id2, &encoded, Some(Bytes::new()))
+            .await
+            .unwrap();
+        let sr = SortedRun::new(
+            0,
+            [
                 SsTableView::new_projected(
                     ulid::Ulid::new(),
                     handle1,
@@ -441,7 +460,7 @@ mod tests {
                     Some(BytesRange::from_ref("key5".."key7")),
                 ),
             ],
-        };
+        );
 
         // when: iterating the full range, then: only visible keys appear
         let mut iter = SortedRunIterator::new_borrowed_initialized(
@@ -482,10 +501,12 @@ mod tests {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store, None),
+            object_store,
             format,
             root_path.clone(),
             None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let key_gen = OrderedBytesGenerator::new_with_byte_range(&[b'a'; 16], b'a', b'z');
         let mut test_case_key_gen = key_gen.clone();
@@ -526,10 +547,12 @@ mod tests {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store, None),
+            object_store,
             format,
             root_path.clone(),
             None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let key_gen = OrderedBytesGenerator::new_with_byte_range(&[b'a'; 16], b'a', b'z');
         let mut expected_key_gen = key_gen.clone();
@@ -564,10 +587,12 @@ mod tests {
             ..SsTableFormat::default()
         };
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store, None),
+            object_store,
             format,
             root_path.clone(),
             None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
         let key_gen = OrderedBytesGenerator::new_with_byte_range(&[b'a'; 16], b'a', b'z');
         let val_gen = OrderedBytesGenerator::new_with_byte_range(&[0u8; 16], 0u8, 26u8);
@@ -590,10 +615,12 @@ mod tests {
         let root_path = Path::from("");
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(object_store, None),
+            object_store,
             SsTableFormat::default(),
             root_path.clone(),
             None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
 
         let mut rng = proptest_util::rng::new_test_rng(None);
@@ -658,15 +685,15 @@ mod tests {
             }
 
             let encoded = builder.build().await.unwrap();
-            let id = SsTableId::Compacted(ulid::Ulid::new());
-            let handle = table_store.write_sst(&id, &encoded, false).await.unwrap();
+            let id = SsTableId::from(ulid::Ulid::new());
+            let handle = table_store
+                .write_sst(&id, &encoded, Some(Bytes::new()))
+                .await
+                .unwrap();
             ssts.push(SsTableView::identity(handle));
         }
 
-        SortedRun {
-            id: 0,
-            sst_views: ssts,
-        }
+        SortedRun::new(0, ssts)
     }
 
     async fn build_sr_with_ssts(
@@ -678,19 +705,17 @@ mod tests {
     ) -> SortedRun {
         let mut ssts = Vec::<SsTableView>::new();
         for _ in 0..n {
-            let mut writer = table_store.table_writer(SsTableId::Compacted(ulid::Ulid::new()));
+            let mut writer =
+                table_store.table_writer(SsTableId::from(ulid::Ulid::new()), Some(Bytes::new()));
             for _ in 0..keys_per_sst {
                 let entry =
                     RowEntry::new_value(key_gen.next().as_ref(), val_gen.next().as_ref(), 0);
                 writer.add(entry).await.unwrap();
             }
-            let sst = writer.close().await.unwrap();
+            let (sst, _) = writer.close().await.unwrap();
             ssts.push(SsTableView::identity(sst));
         }
-        SortedRun {
-            id: 0,
-            sst_views: ssts,
-        }
+        SortedRun::new(0, ssts)
     }
 
     mod mixed_version_tests {
@@ -708,8 +733,11 @@ mod tests {
                 builder.add_value(key, value, Some(0), None).await.unwrap();
             }
             let encoded = builder.build().await.unwrap();
-            let id = SsTableId::Compacted(ulid::Ulid::new());
-            table_store.write_sst(&id, &encoded, false).await.unwrap()
+            let id = SsTableId::from(ulid::Ulid::new());
+            table_store
+                .write_sst(&id, &encoded, Some(Bytes::new()))
+                .await
+                .unwrap()
         }
 
         async fn build_sst_v2(
@@ -722,8 +750,11 @@ mod tests {
                 builder.add_value(key, value, Some(0), None).await.unwrap();
             }
             let encoded = builder.build().await.unwrap();
-            let id = SsTableId::Compacted(ulid::Ulid::new());
-            table_store.write_sst(&id, &encoded, false).await.unwrap()
+            let id = SsTableId::from(ulid::Ulid::new());
+            table_store
+                .write_sst(&id, &encoded, Some(Bytes::new()))
+                .await
+                .unwrap()
         }
 
         #[tokio::test]
@@ -736,10 +767,12 @@ mod tests {
                 ..SsTableFormat::default()
             };
             let table_store = Arc::new(TableStore::new(
-                ObjectStores::new(object_store, None),
+                object_store,
                 format,
                 root_path,
                 None,
+                TableStoreKind::Main,
+                BlockCachePolicy::default(),
             ));
 
             // Build a sorted run with v1, v2, v1, v2 SSTs
@@ -764,15 +797,15 @@ mod tests {
             )
             .await;
 
-            let sorted_run = SortedRun {
-                id: 0,
-                sst_views: vec![
+            let sorted_run = SortedRun::new(
+                0,
+                [
                     SsTableView::identity(sst1_v1),
                     SsTableView::identity(sst2_v2),
                     SsTableView::identity(sst3_v1),
                     SsTableView::identity(sst4_v2),
                 ],
-            };
+            );
 
             // when: iterating over the sorted run
             let mut iter = SortedRunIterator::new_owned_initialized(
@@ -807,10 +840,12 @@ mod tests {
                 ..SsTableFormat::default()
             };
             let table_store = Arc::new(TableStore::new(
-                ObjectStores::new(object_store, None),
+                object_store,
                 format,
                 root_path,
                 None,
+                TableStoreKind::Main,
+                BlockCachePolicy::default(),
             ));
 
             // Build a sorted run with v1, v2, v1, v2 SSTs
@@ -835,15 +870,15 @@ mod tests {
             )
             .await;
 
-            let sorted_run = SortedRun {
-                id: 0,
-                sst_views: vec![
+            let sorted_run = SortedRun::new(
+                0,
+                [
                     SsTableView::identity(sst1_v1),
                     SsTableView::identity(sst2_v2),
                     SsTableView::identity(sst3_v1),
                     SsTableView::identity(sst4_v2),
                 ],
-            };
+            );
 
             let mut iter = SortedRunIterator::new_owned_initialized(
                 ..,

@@ -75,7 +75,7 @@ impl DbReader {
     /// Scans rows inside `range`.
     pub async fn scan(&self, range: KeyRange) -> Result<Arc<DbIterator>, Error> {
         let range = range.into_bounds()?;
-        let iter = self.inner.scan::<Vec<u8>, _>(range).await?;
+        let iter = self.inner.scan(range).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
@@ -87,29 +87,34 @@ impl DbReader {
     ) -> Result<Arc<DbIterator>, Error> {
         let range = range.into_bounds()?;
         let options = options.try_into()?;
-        let iter = self
-            .inner
-            .scan_with_options::<Vec<u8>, _>(range, &options)
-            .await?;
+        let iter = self.inner.scan_with_options(range, &options).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
-    /// Scans rows whose keys start with `prefix`.
-    pub async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<Arc<DbIterator>, Error> {
-        let iter = self.inner.scan_prefix(prefix, ..).await?;
+    /// Scans rows whose keys start with `prefix`, restricted to `subrange`.
+    pub async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        subrange: KeyRange,
+    ) -> Result<Arc<DbIterator>, Error> {
+        let subrange = subrange.into_bounds()?;
+        let iter = self.inner.scan_prefix(prefix, subrange).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
-    /// Scans rows whose keys start with `prefix` using custom scan options.
+    /// Scans rows whose keys start with `prefix`, restricted to `subrange`,
+    /// using custom scan options.
     pub async fn scan_prefix_with_options(
         &self,
         prefix: Vec<u8>,
+        subrange: KeyRange,
         options: ScanOptions,
     ) -> Result<Arc<DbIterator>, Error> {
+        let subrange = subrange.into_bounds()?;
         let options = options.try_into()?;
         let iter = self
             .inner
-            .scan_prefix_with_options(prefix, .., &options)
+            .scan_prefix_with_options(prefix, subrange, &options)
             .await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
@@ -143,6 +148,24 @@ impl DbReader {
     pub async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), Error> {
         let sst_id = sst_id.into_core()?;
         self.inner.evict_cached_sst(sst_id).await?;
+        Ok(())
+    }
+
+    /// Sends this reader's cached data to disk.
+    ///
+    /// This moves data for this instance's scope id from memory to disk.
+    /// It frees memory now, and protects the data from an ungraceful
+    /// process exit later. A later instance with the same scope id can
+    /// read the data back from disk.
+    ///
+    /// This affects the whole scope, not only this instance's own reads
+    /// and writes. If another instance uses the same scope id, this call
+    /// also flushes that instance's data.
+    ///
+    /// Does nothing if no block cache is set, or if the cache has no disk
+    /// storage.
+    pub async fn flush_cache_to_disk(&self) -> Result<(), Error> {
+        self.inner.flush_cache_to_disk().await?;
         Ok(())
     }
 }

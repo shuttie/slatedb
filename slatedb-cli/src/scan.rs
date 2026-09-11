@@ -6,7 +6,7 @@ use std::sync::Arc;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use slatedb::config::ScanOptions;
-use slatedb::DbReader;
+use slatedb::{DbReader, DbReaderMode};
 use uuid::Uuid;
 
 type KeyRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -58,9 +58,10 @@ pub(crate) async fn exec_scan(
         .transpose()?;
     let range = build_range(from.as_deref(), to.as_deref(), key_mode)?;
 
-    let mut builder = DbReader::builder(path, object_store);
+    let mut builder =
+        DbReader::builder(path, object_store).with_reader_mode(DbReaderMode::FollowLatest);
     if let Some(checkpoint_id) = checkpoint {
-        builder = builder.with_checkpoint_id(checkpoint_id);
+        builder = builder.with_reader_mode(DbReaderMode::Checkpoint(checkpoint_id));
     }
     let reader = builder.build().await?;
 
@@ -76,11 +77,7 @@ pub(crate) async fn exec_scan(
                 .scan_prefix_with_options(prefix, .., &scan_opts)
                 .await?
         }
-        None => {
-            reader
-                .scan_with_options::<Vec<u8>, _>(range, &scan_opts)
-                .await?
-        }
+        None => reader.scan_with_options(range, &scan_opts).await?,
     };
 
     let mut out = io::BufWriter::new(io::stdout().lock());

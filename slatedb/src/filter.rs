@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::filter_policy::{Filter, FilterBuilder, FilterQuery};
+use crate::filter_policy::{Filter, FilterBuilder, FilterQuery, FilterTarget};
 use crate::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use crate::types::RowEntry;
 use crate::utils::clamp_allocated_size_bytes;
@@ -113,7 +113,7 @@ impl BloomFilter {
     /// checksum, which are accounted for at the SST level.
     pub(crate) fn estimate_encoded_size(num_keys: u32, filter_bits_per_key: u32) -> usize {
         let filter_bytes = BloomFilterBuilder::filter_size_bytes(num_keys, filter_bits_per_key);
-        let num_probes_size = std::mem::size_of::<u16>();
+        let num_probes_size = size_of::<u16>();
         filter_bytes + num_probes_size
     }
 
@@ -122,6 +122,11 @@ impl BloomFilter {
     }
 
     fn might_contain(&self, hash: u64) -> bool {
+        // A filter built with zero extracted hashes has zero bits: nothing can
+        // match, and probing it would divide by zero in probes_for_key.
+        if self.buffer.is_empty() {
+            return false;
+        }
         for p in probes_for_key(hash, self.num_probes, self.filter_bits()) {
             if !check_bit(p as usize, &self.buffer) {
                 return false;
@@ -144,7 +149,7 @@ impl FilterBuilder for BloomFilterBuilder {
 impl Filter for BloomFilter {
     fn might_match(&self, query: &FilterQuery) -> bool {
         // Full-key hash gives the tightest answer whenever it was stored.
-        if let (PrefixTarget::Point(key), true) = (&query.target, self.whole_key_filtering) {
+        if let (FilterTarget::Point(key), true) = (&query.target, self.whole_key_filtering) {
             return self.might_contain(filter_hash(key.as_ref()));
         }
 
@@ -159,10 +164,14 @@ impl Filter for BloomFilter {
         let Some(ref extractor) = self.prefix_extractor else {
             return true;
         };
-        let Some(n) = extractor.prefix_len(&query.target) else {
+        // Hashes of keys and prefixes only, so a range is unanswerable here.
+        let Some(prefix_target) = query.target.as_prefix_target() else {
             return true;
         };
-        let bytes = match &query.target {
+        let Some(n) = extractor.prefix_len(&prefix_target) else {
+            return true;
+        };
+        let bytes = match &prefix_target {
             PrefixTarget::Point(k) => k.as_ref(),
             PrefixTarget::Prefix(p) => p.as_ref(),
         };
@@ -237,6 +246,7 @@ fn optimal_num_probes(bits_per_key: u32) -> u16 {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+    use std::ops::Bound;
 
     fn point_builder(bits_per_key: u32) -> BloomFilterBuilder {
         BloomFilterBuilder::new(bits_per_key, true, None)
@@ -441,5 +451,74 @@ mod tests {
             BloomFilter::estimate_encoded_size(num_keys, bits_per_key),
             expected_size
         );
+    }
+
+    /// Extracts a fixed 4-byte prefix; shorter targets yield no prefix.
+    struct GatedFixed4;
+
+    impl PrefixExtractor for GatedFixed4 {
+        fn name(&self) -> &str {
+            "gated_fixed_4"
+        }
+
+        fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+            let bytes = match target {
+                PrefixTarget::Point(k) => k.as_ref(),
+                PrefixTarget::Prefix(p) => p.as_ref(),
+            };
+            (bytes.len() >= 4).then_some(4)
+        }
+    }
+
+    #[test]
+    fn test_prefix_only_filter_with_no_extracted_prefixes() {
+        // Zero extracted prefixes + whole-key filtering off = zero-bit filter.
+        // Probing it must not panic, and a miss is safe: nothing was hashed in.
+        let mut builder = BloomFilterBuilder::new(10, false, Some(Arc::new(GatedFixed4)));
+        builder.add_key(&Bytes::from_static(b"a"));
+        builder.add_key(&Bytes::from_static(b"b"));
+        let filter = builder.build_filter();
+        assert!(filter.buffer.is_empty());
+
+        assert!(!filter.might_match(&FilterQuery::prefix(Bytes::from_static(b"aaaa"))));
+        assert!(!filter.might_match(&FilterQuery::point(Bytes::from_static(b"aaaa_key"))));
+
+        // Queries the extractor rejects never reach the filter and must keep
+        // reporting "might match", so the stored short keys stay reachable.
+        assert!(filter.might_match(&FilterQuery::prefix(Bytes::from_static(b"a"))));
+        assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"a"))));
+    }
+
+    #[test]
+    fn test_bloom_filter_abstains_on_range_queries() {
+        let mut builder = BloomFilterBuilder::new(10, false, Some(Arc::new(GatedFixed4)));
+        builder.add_key(&Bytes::from_static(b"aaaa_key"));
+        let filter = builder.build_filter();
+
+        // The filter has real content: a prefix it never saw is rejected.
+        assert!(!filter.might_match(&FilterQuery::prefix(Bytes::from_static(b"bbbb"))));
+
+        // It stores hashes of keys and prefixes, never ranges, so a range
+        // query must abstain rather than reject. A wrong `false` here would
+        // skip an SST holding rows the scan must see.
+        assert!(filter.might_match(&FilterQuery::range(
+            Bound::Included(Bytes::from_static(b"bbbb")),
+            Bound::Excluded(Bytes::from_static(b"bbbc")),
+        )));
+    }
+
+    #[test]
+    fn test_combined_filter_with_no_extracted_prefixes() {
+        // With whole-key filtering on, every key hashes into the filter even
+        // when the extractor yields nothing, so the empty-filter guard never fires.
+        let mut builder = BloomFilterBuilder::new(10, true, Some(Arc::new(GatedFixed4)));
+        builder.add_key(&Bytes::from_static(b"a"));
+        builder.add_key(&Bytes::from_static(b"b"));
+        let filter = builder.build_filter();
+        assert!(!filter.buffer.is_empty());
+
+        // Point lookups take the whole-key path and find the stored keys.
+        assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"a"))));
+        assert!(filter.might_match(&FilterQuery::point(Bytes::from_static(b"b"))));
     }
 }

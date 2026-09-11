@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import pytest
-
 from conftest import (
-    ConcatMergeOperator,
     TEST_DB_PATH,
+    ConcatMergeOperator,
     drain_iterator,
     new_memory_store,
     open_db,
@@ -15,13 +14,17 @@ from conftest import (
     scan_options,
     wait_until,
 )
+
 from slatedb.uniffi import (
     CloseReason,
+    DbCache,
     DbReaderBuilder,
     Error,
     FlushOptions,
     FlushType,
     KeyRange,
+    MokaCacheOptions,
+    ReaderMode,
 )
 
 
@@ -125,15 +128,44 @@ async def test_reader_scan_variants() -> None:
                 ["first", "second", "third"],
             )
 
-            prefix_scan = await reader.scan_prefix(b"item:")
+            prefix_scan = await reader.scan_prefix(
+                b"item:",
+                KeyRange(
+                    start=None,
+                    start_inclusive=False,
+                    end=None,
+                    end_inclusive=False,
+                ),
+            )
             require_rows(
                 await drain_iterator(prefix_scan),
                 ["item:01", "item:02", "item:03"],
                 ["first", "second", "third"],
             )
 
+            bounded_prefix_scan = await reader.scan_prefix(
+                b"item:",
+                KeyRange(
+                    start=b"02",
+                    start_inclusive=False,
+                    end=b"03",
+                    end_inclusive=True,
+                ),
+            )
+            require_rows(
+                await drain_iterator(bounded_prefix_scan),
+                ["item:03"],
+                ["third"],
+            )
+
             prefix_scan_with_options = await reader.scan_prefix_with_options(
                 b"item:",
+                KeyRange(
+                    start=None,
+                    start_inclusive=False,
+                    end=None,
+                    end_inclusive=False,
+                ),
                 scan_options(32, False, 1),
             )
             require_rows(
@@ -168,18 +200,17 @@ async def test_reader_refresh_polling_updates_visible_state() -> None:
 async def test_reader_default_mode_replays_new_wal_data() -> None:
     store = new_memory_store()
 
-    async with open_db(store) as db:
-        async with open_reader(
-            store,
-            configure=lambda builder: builder.with_options(reader_options(False)),
-        ) as reader:
-            await db.put(b"wal-key", b"wal-value")
-            await db.flush_with_options(FlushOptions(flush_type=FlushType.WAL))
+    async with open_db(store) as db, open_reader(
+        store,
+        configure=lambda builder: builder.with_options(reader_options(False)),
+    ) as reader:
+        await db.put(b"wal-key", b"wal-value")
+        await db.flush_with_options(FlushOptions(flush_type=FlushType.WAL))
 
-            async def has_wal_value() -> bool:
-                return await reader.get(b"wal-key") == b"wal-value"
+        async def has_wal_value() -> bool:
+            return await reader.get(b"wal-key") == b"wal-value"
 
-            await wait_until(has_wal_value)
+        await wait_until(has_wal_value)
 
 
 @pytest.mark.asyncio
@@ -238,11 +269,13 @@ async def test_reader_builder_validation_and_errors() -> None:
 
         invalid_builder = DbReaderBuilder(TEST_DB_PATH, store)
         with pytest.raises(Error.Invalid) as exc:
-            invalid_builder.with_checkpoint_id("not-a-uuid")
+            invalid_builder.with_reader_mode(ReaderMode.CHECKPOINT("not-a-uuid"))
         assert exc.value.message.startswith("invalid checkpoint_id UUID:")
 
         missing_builder = DbReaderBuilder(TEST_DB_PATH, store)
-        missing_builder.with_checkpoint_id("ffffffff-ffff-ffff-ffff-ffffffffffff")
+        missing_builder.with_reader_mode(
+            ReaderMode.CHECKPOINT("ffffffff-ffff-ffff-ffff-ffffffffffff")
+        )
         with pytest.raises(Error.Data) as exc:
             await missing_builder.build()
         assert "checkpoint missing" in exc.value.message
@@ -293,3 +326,49 @@ async def test_reader_invalid_ranges_raise_invalid_errors() -> None:
                 KeyRange(start=b"", start_inclusive=True, end=None, end_inclusive=False)
             )
             require_rows(await drain_iterator(scan), ["seed"], ["value"])
+
+
+@pytest.mark.asyncio
+async def test_reader_shared_db_cache() -> None:
+    store = new_memory_store()
+
+    async with open_db(store) as db:
+        await db.put(b"cached", b"value")
+        await db.flush_with_options(FlushOptions(flush_type=FlushType.MEM_TABLE))
+
+        shared_cache = DbCache.new_moka_cache(
+            MokaCacheOptions(max_capacity=1024 * 1024, time_to_live=None, time_to_idle=None)
+        )
+
+        async with open_reader(
+            store,
+            configure=lambda builder: builder.with_db_cache(shared_cache, 0),
+        ) as first_reader, open_reader(
+            store,
+            configure=lambda builder: builder.with_db_cache(shared_cache, 0),
+        ) as second_reader:
+            assert await first_reader.get(b"cached") == b"value"
+            assert await second_reader.get(b"cached") == b"value"
+
+        # The shared cache outlives the readers that used it.
+        async with open_reader(
+            store,
+            configure=lambda builder: builder.with_db_cache(shared_cache, 0),
+        ) as reader:
+            assert await reader.get(b"cached") == b"value"
+
+
+@pytest.mark.asyncio
+async def test_reader_db_cache_disabled() -> None:
+    store = new_memory_store()
+
+    async with open_db(store) as db:
+        await db.put(b"uncached", b"value")
+        await db.flush_with_options(FlushOptions(flush_type=FlushType.MEM_TABLE))
+
+        async with open_reader(
+            store,
+            configure=lambda builder: builder.with_db_cache_disabled(),
+        ) as reader:
+            assert await reader.get(b"uncached") == b"value"
+            assert await reader.get(b"missing") is None

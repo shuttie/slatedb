@@ -4,8 +4,9 @@ import asyncio
 import inspect
 import threading
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
-from typing import Any, Callable
+from typing import Any
 
 from slatedb.uniffi import (
     DbBuilder,
@@ -23,13 +24,14 @@ from slatedb.uniffi import (
     PrefixExtractor,
     PrefixTarget,
     PutOptions,
-    ReadOptions,
     ReaderOptions,
+    ReadOptions,
     RowEntry,
     RowEntryKind,
     ScanOptions,
+    SlateDbWalIterator,
     Ttl,
-    WalFileIterator,
+    WalRows,
     WriteOptions,
 )
 
@@ -51,6 +53,7 @@ def read_options() -> ReadOptions:
         durability_filter=DurabilityLevel.MEMORY,
         dirty=False,
         cache_blocks=True,
+        tracing_options=None,
     )
 
 
@@ -63,6 +66,7 @@ def scan_options(
         read_ahead_bytes=read_ahead_bytes,
         cache_blocks=cache_blocks,
         max_fetch_tasks=max_fetch_tasks,
+        tracing_options=None,
     )
 
 
@@ -76,7 +80,7 @@ def reader_options(skip_wal_replay: bool) -> ReaderOptions:
 
 
 def write_options() -> WriteOptions:
-    return WriteOptions(await_durable=True)
+    return WriteOptions()
 
 
 def put_options() -> PutOptions:
@@ -128,13 +132,15 @@ async def drain_iterator(iterator: DbIterator) -> list[KeyValue]:
         rows.append(row)
 
 
-async def drain_wal_iterator(iterator: WalFileIterator) -> list[RowEntry]:
-    rows: list[RowEntry] = []
-    while True:
-        row = await iterator.next()
-        if row is None:
-            return rows
-        rows.append(row)
+async def read_wal_batches_through(
+    iterator: SlateDbWalIterator, end_wal_file_id: int
+) -> list[WalRows]:
+    batches: list[WalRows] = []
+    while not batches or batches[-1].last_consumed_wal_file_id < end_wal_file_id:
+        batch = await iterator.next()
+        assert batch is not None, "live WAL iterator ended unexpectedly"
+        batches.append(batch)
+    return batches
 
 
 def require_rows(rows: list[KeyValue], want_keys: list[str], want_values: list[str]) -> None:
@@ -166,7 +172,7 @@ async def wait_until(
             if await _maybe_await(check()):
                 return
             last_error = None
-        except Exception as error:  # pragma: no cover - helper for polling assertions
+        except Exception as error:  # noqa: BLE001  # pragma: no cover - helper for polling assertions
             last_error = error
 
         if asyncio.get_running_loop().time() >= deadline:
@@ -235,6 +241,15 @@ async def seed_wal_files(store: ObjectStore) -> None:
         await db.flush_with_options(FlushOptions(flush_type=FlushType.WAL))
 
         await db.merge(b"m", b"x")
+        await db.flush_with_options(FlushOptions(flush_type=FlushType.WAL))
+
+
+async def append_wal_value(store: ObjectStore, key: bytes, value: bytes) -> None:
+    async with open_db(
+        store,
+        configure=lambda builder: builder.with_merge_operator(ConcatMergeOperator()),
+    ) as db:
+        await db.put(key, value)
         await db.flush_with_options(FlushOptions(flush_type=FlushType.WAL))
 
 

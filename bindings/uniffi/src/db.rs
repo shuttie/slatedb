@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
 use crate::config::{
-    FlushOptions, IsolationLevel, MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions,
+    CloseOptions, FlushOptions, IsolationLevel, MergeOptions, PutOptions, ReadOptions, ScanOptions,
+    WriteOptions,
 };
 use crate::db_snapshot::DbSnapshot;
 use crate::db_transaction::DbTransaction;
 use crate::error::Error;
 use crate::iterator::DbIterator;
-use crate::types::{CacheTarget, DbStatus, KeyRange, KeyValue, SsTableId, WriteHandle};
+use crate::types::{CacheTarget, DbStatus, KeyRange, KeyValue, SsTableId};
 use crate::validation::{validate_key, validate_key_value};
 use crate::write_batch::WriteBatch;
+use crate::write_handle::WriteHandle;
 use slatedb::DbCacheManagerOps;
 
 /// A writable SlateDB handle.
@@ -40,6 +42,15 @@ impl Db {
     #[uniffi::method(name = "shutdown")]
     pub async fn close(&self) -> Result<(), Error> {
         self.inner.close().await.map_err(Into::into)
+    }
+
+    /// Performs the requested final flush and closes the database.
+    #[uniffi::method(name = "shutdown_with_options")]
+    pub async fn close_with_options(&self, options: CloseOptions) -> Result<(), Error> {
+        self.inner
+            .close_with_options(options.into())
+            .await
+            .map_err(Into::into)
     }
 
     /// Reads the current value for `key`.
@@ -87,7 +98,7 @@ impl Db {
     /// Scans rows inside `range`.
     pub async fn scan(&self, range: KeyRange) -> Result<Arc<DbIterator>, Error> {
         let range = range.into_bounds()?;
-        let iter = self.inner.scan::<Vec<u8>, _>(range).await?;
+        let iter = self.inner.scan(range).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
@@ -99,29 +110,34 @@ impl Db {
     ) -> Result<Arc<DbIterator>, Error> {
         let range = range.into_bounds()?;
         let options = options.try_into()?;
-        let iter = self
-            .inner
-            .scan_with_options::<Vec<u8>, _>(range, &options)
-            .await?;
+        let iter = self.inner.scan_with_options(range, &options).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
-    /// Scans rows whose keys start with `prefix`.
-    pub async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<Arc<DbIterator>, Error> {
-        let iter = self.inner.scan_prefix(prefix, ..).await?;
+    /// Scans rows whose keys start with `prefix`, restricted to `subrange`.
+    pub async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        subrange: KeyRange,
+    ) -> Result<Arc<DbIterator>, Error> {
+        let subrange = subrange.into_bounds()?;
+        let iter = self.inner.scan_prefix(prefix, subrange).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
-    /// Scans rows whose keys start with `prefix` using custom scan options.
+    /// Scans rows whose keys start with `prefix`, restricted to `subrange`,
+    /// using custom scan options.
     pub async fn scan_prefix_with_options(
         &self,
         prefix: Vec<u8>,
+        subrange: KeyRange,
         options: ScanOptions,
     ) -> Result<Arc<DbIterator>, Error> {
+        let subrange = subrange.into_bounds()?;
         let options = options.try_into()?;
         let iter = self
             .inner
-            .scan_prefix_with_options(prefix, .., &options)
+            .scan_prefix_with_options(prefix, subrange, &options)
             .await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
@@ -130,9 +146,11 @@ impl Db {
     ///
     /// Keys must be non-empty and at most `u16::MAX` bytes. Values must be at
     /// most `u32::MAX` bytes.
-    pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<WriteHandle, Error> {
+    pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<Arc<WriteHandle>, Error> {
         validate_key_value(&key, &value)?;
-        Ok(self.inner.put(key, value).await?.into())
+        Ok(Arc::new(WriteHandle::new(
+            self.inner.put(key, value).await?,
+        )))
     }
 
     /// Inserts or overwrites a value using custom put and write options.
@@ -142,21 +160,21 @@ impl Db {
         value: Vec<u8>,
         put_options: PutOptions,
         write_options: WriteOptions,
-    ) -> Result<WriteHandle, Error> {
+    ) -> Result<Arc<WriteHandle>, Error> {
         validate_key_value(&key, &value)?;
         let put_options = put_options.into();
         let write_options = write_options.into();
-        Ok(self
-            .inner
-            .put_with_options(key, value, &put_options, &write_options)
-            .await?
-            .into())
+        Ok(Arc::new(WriteHandle::new(
+            self.inner
+                .put_with_options(key, value, &put_options, &write_options)
+                .await?,
+        )))
     }
 
     /// Deletes `key` and returns metadata for the write.
-    pub async fn delete(&self, key: Vec<u8>) -> Result<WriteHandle, Error> {
+    pub async fn delete(&self, key: Vec<u8>) -> Result<Arc<WriteHandle>, Error> {
         validate_key(&key)?;
-        Ok(self.inner.delete(key).await?.into())
+        Ok(Arc::new(WriteHandle::new(self.inner.delete(key).await?)))
     }
 
     /// Deletes `key` using custom write options.
@@ -164,16 +182,20 @@ impl Db {
         &self,
         key: Vec<u8>,
         options: WriteOptions,
-    ) -> Result<WriteHandle, Error> {
+    ) -> Result<Arc<WriteHandle>, Error> {
         validate_key(&key)?;
         let options = options.into();
-        Ok(self.inner.delete_with_options(key, &options).await?.into())
+        Ok(Arc::new(WriteHandle::new(
+            self.inner.delete_with_options(key, &options).await?,
+        )))
     }
 
     /// Appends a merge operand for `key` and returns metadata for the write.
-    pub async fn merge(&self, key: Vec<u8>, operand: Vec<u8>) -> Result<WriteHandle, Error> {
+    pub async fn merge(&self, key: Vec<u8>, operand: Vec<u8>) -> Result<Arc<WriteHandle>, Error> {
         validate_key_value(&key, &operand)?;
-        Ok(self.inner.merge(key, operand).await?.into())
+        Ok(Arc::new(WriteHandle::new(
+            self.inner.merge(key, operand).await?,
+        )))
     }
 
     /// Appends a merge operand using custom merge and write options.
@@ -183,23 +205,23 @@ impl Db {
         operand: Vec<u8>,
         merge_options: MergeOptions,
         write_options: WriteOptions,
-    ) -> Result<WriteHandle, Error> {
+    ) -> Result<Arc<WriteHandle>, Error> {
         validate_key_value(&key, &operand)?;
         let merge_options = merge_options.into();
         let write_options = write_options.into();
-        Ok(self
-            .inner
-            .merge_with_options(key, operand, &merge_options, &write_options)
-            .await?
-            .into())
+        Ok(Arc::new(WriteHandle::new(
+            self.inner
+                .merge_with_options(key, operand, &merge_options, &write_options)
+                .await?,
+        )))
     }
 
     /// Applies all operations in `batch` atomically.
     ///
     /// The provided batch is consumed and cannot be reused afterwards.
-    pub async fn write(&self, batch: Arc<WriteBatch>) -> Result<WriteHandle, Error> {
+    pub async fn write(&self, batch: Arc<WriteBatch>) -> Result<Arc<WriteHandle>, Error> {
         let batch = batch.take_for_write()?;
-        Ok(self.inner.write(batch).await?.into())
+        Ok(Arc::new(WriteHandle::new(self.inner.write(batch).await?)))
     }
 
     /// Applies all operations in `batch` atomically using custom write options.
@@ -209,10 +231,12 @@ impl Db {
         &self,
         batch: Arc<WriteBatch>,
         options: WriteOptions,
-    ) -> Result<WriteHandle, Error> {
+    ) -> Result<Arc<WriteHandle>, Error> {
         let batch = batch.take_for_write()?;
         let options = options.into();
-        Ok(self.inner.write_with_options(batch, &options).await?.into())
+        Ok(Arc::new(WriteHandle::new(
+            self.inner.write_with_options(batch, &options).await?,
+        )))
     }
 
     /// Flushes the default storage layer.
@@ -264,6 +288,24 @@ impl Db {
     pub async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), Error> {
         let sst_id = sst_id.into_core()?;
         self.inner.evict_cached_sst(sst_id).await?;
+        Ok(())
+    }
+
+    /// Sends this Db's cached data to disk.
+    ///
+    /// This moves data for this instance's scope id from memory to disk.
+    /// It frees memory now, and protects the data from an ungraceful
+    /// process exit later. A later instance with the same scope id can
+    /// read the data back from disk.
+    ///
+    /// This affects the whole scope, not only this instance's own reads
+    /// and writes. If another instance uses the same scope id, this call
+    /// also flushes that instance's data.
+    ///
+    /// Does nothing if no block cache is set, or if the cache has no disk
+    /// storage.
+    pub async fn flush_cache_to_disk(&self) -> Result<(), Error> {
+        self.inner.flush_cache_to_disk().await?;
         Ok(())
     }
 }

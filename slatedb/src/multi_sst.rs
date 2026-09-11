@@ -78,9 +78,11 @@ pub(crate) async fn read_sst_for_keys(
     let handle = &view.sst;
 
     // Step 1: load the SST index and filters once for the whole batch.
-    let index = table_store.read_index(handle, options.cache_blocks).await?;
+    let index = table_store
+        .read_index(handle, options.cache_blocks, options.segment.clone())
+        .await?;
     let filters = table_store
-        .read_filters(handle, options.cache_blocks)
+        .read_filters(handle, options.cache_blocks, options.segment.clone())
         .await?;
     if index.borrow().block_meta().is_empty() {
         return Ok(Vec::new());
@@ -96,6 +98,7 @@ pub(crate) async fn read_sst_for_keys(
         &index,
         &candidates,
         options.cache_blocks,
+        options.segment.clone(),
         table_store,
     )
     .await?;
@@ -172,6 +175,7 @@ async fn fetch_candidate_blocks(
     index: &Arc<SsTableIndexOwned>,
     candidates: &[Candidate],
     cache_blocks: bool,
+    segment: Option<Bytes>,
     table_store: &Arc<TableStore>,
 ) -> Result<BTreeMap<usize, Arc<Block>>, SlateDBError> {
     let mut needed: Vec<usize> = Vec::new();
@@ -184,7 +188,13 @@ async fn fetch_candidate_blocks(
     let mut blocks: BTreeMap<usize, Arc<Block>> = BTreeMap::new();
     for run in coalesce_runs(&needed, COALESCE_GAP_BLOCKS) {
         let fetched = table_store
-            .read_blocks_using_index(handle, index.clone(), run.clone(), cache_blocks)
+            .read_blocks_using_index(
+                handle,
+                index.clone(),
+                run.clone(),
+                cache_blocks,
+                segment.clone(),
+            )
             .await?;
         for (offset, block) in fetched.into_iter().enumerate() {
             blocks.insert(run.start + offset, block);

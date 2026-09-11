@@ -5,8 +5,9 @@ use tokio::sync::Mutex;
 use crate::config::{MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use crate::error::{Error, SlateDbError};
 use crate::iterator::DbIterator;
-use crate::types::{KeyRange, KeyValue, WriteHandle};
+use crate::types::{KeyRange, KeyValue};
 use crate::validation::{validate_key, validate_key_value};
+use crate::write_handle::WriteHandle;
 
 /// Transaction handle returned by [`crate::Db::begin`].
 ///
@@ -173,7 +174,7 @@ impl DbTransaction {
         let range = range.into_bounds()?;
         let guard = self.inner.lock().await;
         let tx = guard.as_ref().ok_or(SlateDbError::TransactionCompleted)?;
-        let iter = tx.scan::<Vec<u8>, _>(range).await?;
+        let iter = tx.scan(range).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
@@ -187,40 +188,54 @@ impl DbTransaction {
         let options = options.try_into()?;
         let guard = self.inner.lock().await;
         let tx = guard.as_ref().ok_or(SlateDbError::TransactionCompleted)?;
-        let iter = tx.scan_with_options::<Vec<u8>, _>(range, &options).await?;
+        let iter = tx.scan_with_options(range, &options).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
-    /// Scans rows whose keys start with `prefix` as visible to this transaction.
-    pub async fn scan_prefix(&self, prefix: Vec<u8>) -> Result<Arc<DbIterator>, Error> {
+    /// Scans rows whose keys start with `prefix` as visible to this transaction,
+    /// restricted to `subrange`.
+    pub async fn scan_prefix(
+        &self,
+        prefix: Vec<u8>,
+        subrange: KeyRange,
+    ) -> Result<Arc<DbIterator>, Error> {
+        let subrange = subrange.into_bounds()?;
         let guard = self.inner.lock().await;
         let tx = guard.as_ref().ok_or(SlateDbError::TransactionCompleted)?;
-        let iter = tx.scan_prefix(prefix, ..).await?;
+        let iter = tx.scan_prefix(prefix, subrange).await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
-    /// Scans rows whose keys start with `prefix` as visible to this transaction using custom options.
+    /// Scans rows whose keys start with `prefix` as visible to this transaction,
+    /// restricted to `subrange`, using custom options.
     pub async fn scan_prefix_with_options(
         &self,
         prefix: Vec<u8>,
+        subrange: KeyRange,
         options: ScanOptions,
     ) -> Result<Arc<DbIterator>, Error> {
+        let subrange = subrange.into_bounds()?;
         let options = options.try_into()?;
         let guard = self.inner.lock().await;
         let tx = guard.as_ref().ok_or(SlateDbError::TransactionCompleted)?;
-        let iter = tx.scan_prefix_with_options(prefix, .., &options).await?;
+        let iter = tx
+            .scan_prefix_with_options(prefix, subrange, &options)
+            .await?;
         Ok(Arc::new(DbIterator::new(iter)))
     }
 
     /// Commits the transaction.
     ///
     /// Returns `None` when the transaction performed no writes.
-    pub async fn commit(&self) -> Result<Option<WriteHandle>, Error> {
+    pub async fn commit(&self) -> Result<Option<Arc<WriteHandle>>, Error> {
         let tx = {
             let mut guard = self.inner.lock().await;
             guard.take().ok_or(SlateDbError::TransactionCompleted)?
         };
-        Ok(tx.commit().await?.map(WriteHandle::from))
+        Ok(tx
+            .commit()
+            .await?
+            .map(|handle| Arc::new(WriteHandle::new(handle))))
     }
 
     /// Commits the transaction using custom write options.
@@ -229,7 +244,7 @@ impl DbTransaction {
     pub async fn commit_with_options(
         &self,
         options: WriteOptions,
-    ) -> Result<Option<WriteHandle>, Error> {
+    ) -> Result<Option<Arc<WriteHandle>>, Error> {
         let options = options.into();
         let tx = {
             let mut guard = self.inner.lock().await;
@@ -238,6 +253,6 @@ impl DbTransaction {
         Ok(tx
             .commit_with_options(&options)
             .await?
-            .map(WriteHandle::from))
+            .map(|handle| Arc::new(WriteHandle::new(handle))))
     }
 }

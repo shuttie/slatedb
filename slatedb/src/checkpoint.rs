@@ -34,10 +34,7 @@ impl Db {
     ) -> Result<CheckpointCreateResult, crate::Error> {
         let target = match scope {
             CheckpointScope::All => {
-                if self.inner.wal_enabled {
-                    self.inner.flush_wals().await?;
-                }
-                self.inner.freeze_current_memtable()?;
+                self.inner.request_batch_writer_flush(true).await?;
                 FlushTarget::All
             }
             CheckpointScope::Durable => FlushTarget::CurrentDurable,
@@ -54,6 +51,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use crate::admin::AdminBuilder;
+    use crate::block_cache_policy::BlockCachePolicy;
     use crate::checkpoint::Checkpoint;
     use crate::checkpoint::CheckpointCreateResult;
     use crate::config::{CheckpointOptions, CheckpointScope, Settings};
@@ -63,10 +61,9 @@ mod tests {
     use crate::iter::RowEntryIterator;
     use crate::manifest::store::ManifestStore;
     use crate::manifest::Manifest;
-    use crate::object_stores::ObjectStores;
     use crate::proptest_util::{rng, sample};
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::tablestore::TableStore;
+    use crate::tablestore::{TableStore, TableStoreKind};
     use crate::test_utils;
     use bytes::Bytes;
     use chrono::TimeDelta;
@@ -442,12 +439,19 @@ mod tests {
         kv: (&Bytes, &Bytes),
     ) {
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(Arc::clone(&object_store), None),
+            Arc::clone(&object_store),
             SsTableFormat::default(),
             path.clone(),
             None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
         ));
-        let sst_handle = SsTableView::identity(table_store.open_sst(table_id).await.unwrap());
+        let sst_handle = SsTableView::identity(
+            table_store
+                .open_sst(table_id, Some(Bytes::new()))
+                .await
+                .unwrap(),
+        );
 
         let mut sst_iter = SstIterator::for_key_with_stats_initialized(
             &sst_handle,

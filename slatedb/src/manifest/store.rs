@@ -5,6 +5,7 @@ use crate::error::SlateDBError::{
     CheckpointMissing, InvalidDBState, LatestTransactionalObjectVersionMissing, ManifestMissing,
 };
 use crate::flatbuffer_types::FlatBufferManifestCodec;
+use crate::manifest::invariants::manifest_invariants;
 use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
 use log::debug;
 use object_store::path::Path;
@@ -64,6 +65,10 @@ impl FenceableManifest {
         )
         .await?;
         Ok(Self { inner: fr, clock })
+    }
+
+    pub(crate) fn manifest(&self) -> (u64, &Manifest) {
+        (self.inner.id().id(), self.inner.object())
     }
 
     pub(crate) fn local_epoch(&self) -> u64 {
@@ -171,6 +176,13 @@ pub(crate) struct StoredManifest {
 }
 
 impl StoredManifest {
+    fn new(inner: SimpleTransactionalObject<Manifest>, clock: Arc<dyn SystemClock>) -> Self {
+        Self {
+            inner: inner.with_invariants(manifest_invariants()),
+            clock,
+        }
+    }
+
     async fn init(
         store: Arc<ManifestStore>,
         manifest: Manifest,
@@ -183,7 +195,7 @@ impl StoredManifest {
             manifest.clone(),
         )
         .await?;
-        Ok(Self { inner, clock })
+        Ok(Self::new(inner, clock))
     }
 
     /// Create the initial manifest for a new database.
@@ -218,7 +230,7 @@ impl StoredManifest {
         else {
             return Ok(None);
         };
-        Ok(Some(Self { inner, clock }))
+        Ok(Some(Self::new(inner, clock)))
     }
 
     /// Load the current manifest from the supplied manifest store. If successful,
@@ -228,11 +240,9 @@ impl StoredManifest {
         store: Arc<ManifestStore>,
         clock: Arc<dyn SystemClock>,
     ) -> Result<Self, SlateDBError> {
-        SimpleTransactionalObject::<Manifest>::try_load(Arc::clone(&store.inner)
-            as Arc<dyn TransactionalStorageProtocol<Manifest, MonotonicId>>)
-        .await?
-        .map(|inner| Self { inner, clock })
-        .ok_or(LatestTransactionalObjectVersionMissing)
+        Self::try_load(store, clock)
+            .await?
+            .ok_or(LatestTransactionalObjectVersionMissing)
     }
 
     #[allow(dead_code)]
@@ -580,12 +590,11 @@ pub(crate) mod test_utils {
 mod tests {
     use crate::checkpoint::Checkpoint;
     use crate::config::CheckpointOptions;
-    use crate::error;
     use crate::error::SlateDBError;
     use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
     use crate::manifest::ManifestCore;
     use crate::retrying_object_store::RetryingObjectStore;
-    use crate::test_utils::FlakyObjectStore;
+    use crate::test_utils::{bounded_sst_view, FlakyObjectStore};
     use chrono::Timelike;
     use object_store::memory::InMemory;
     use object_store::path::Path;
@@ -618,7 +627,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            error::SlateDBError::TransactionalObjectVersionExists
+            SlateDBError::TransactionalObjectVersionExists
         ));
     }
 
@@ -638,6 +647,39 @@ mod tests {
         let version = ms.read_latest_manifest().await.unwrap().id;
 
         assert_eq!(version, 2);
+    }
+
+    #[tokio::test]
+    async fn test_should_enforce_manifest_invariants_after_create() {
+        let ms = new_memory_manifest_store();
+        let mut sm = StoredManifest::create_new_db(
+            ms.clone(),
+            core_with_l0(100),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+
+        assert_l0_invariant_rejects_update(&mut sm).await;
+        assert_eq!(ms.read_latest_manifest().await.unwrap().id, 1);
+    }
+
+    #[tokio::test]
+    async fn test_should_enforce_manifest_invariants_after_load() {
+        let ms = new_memory_manifest_store();
+        StoredManifest::create_new_db(
+            ms.clone(),
+            core_with_l0(100),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let mut sm = StoredManifest::load(ms.clone(), Arc::new(DefaultSystemClock::new()))
+            .await
+            .unwrap();
+
+        assert_l0_invariant_rejects_update(&mut sm).await;
+        assert_eq!(ms.read_latest_manifest().await.unwrap().id, 1);
     }
 
     #[tokio::test]
@@ -751,7 +793,7 @@ mod tests {
             .unwrap();
 
         let result = writer1.refresh().await;
-        assert!(matches!(result, Err(error::SlateDBError::Fenced)));
+        assert!(matches!(result, Err(SlateDBError::Fenced)));
     }
 
     #[tokio::test]
@@ -803,7 +845,7 @@ mod tests {
             .unwrap();
 
         let result = compactor1.refresh().await;
-        assert!(matches!(result, Err(error::SlateDBError::Fenced)));
+        assert!(matches!(result, Err(SlateDBError::Fenced)));
     }
 
     #[tokio::test]
@@ -855,7 +897,7 @@ mod tests {
             .write_checkpoint(uuid::Uuid::new_v4(), &CheckpointOptions::default())
             .await;
 
-        assert!(matches!(result, Err(error::SlateDBError::Fenced)));
+        assert!(matches!(result, Err(SlateDBError::Fenced)));
         assert_state_not_updated(&mut compactor2).await;
     }
 
@@ -939,6 +981,7 @@ mod tests {
             flaky.clone(),
             Arc::new(DbRand::default()),
             Arc::new(DefaultSystemClock::new()),
+            None,
         ));
         let ms = Arc::new(ManifestStore::new(&Path::from(ROOT), retrying.clone()));
 
@@ -1047,12 +1090,37 @@ mod tests {
         assert_eq!(manifests[1].id, 2);
 
         let result = ms.delete_manifest(2).await;
-        assert!(matches!(result, Err(error::SlateDBError::InvalidDeletion)));
+        assert!(matches!(result, Err(SlateDBError::InvalidDeletion)));
     }
 
     fn new_memory_manifest_store() -> Arc<ManifestStore> {
         let os = Arc::new(InMemory::new());
         Arc::new(ManifestStore::new(&Path::from(ROOT), os))
+    }
+
+    fn core_with_l0(timestamp_ms: u64) -> ManifestCore {
+        let mut core = ManifestCore::new();
+        Arc::make_mut(&mut core.tree)
+            .l0
+            .push_front(bounded_sst_view(timestamp_ms, b"a", b"z"));
+        core
+    }
+
+    async fn assert_l0_invariant_rejects_update(sm: &mut StoredManifest) {
+        let mut dirty = sm.prepare_dirty().unwrap();
+        Arc::make_mut(&mut dirty.value.core.tree)
+            .l0
+            .push_front(bounded_sst_view(50, b"a", b"z"));
+
+        let result = sm.update(dirty).await;
+
+        assert!(matches!(
+            result,
+            Err(SlateDBError::InvalidClockTick {
+                last_tick: 100,
+                next_tick: 50
+            })
+        ));
     }
 
     fn new_checkpoint(manifest_id: u64) -> Checkpoint {

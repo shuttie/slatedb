@@ -83,15 +83,12 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
     if args.no_compactor {
         config.compactor_options = None;
     }
-    let write_options = WriteOptions {
-        await_durable: args.await_durable,
-        ..Default::default()
-    };
+    let write_options = WriteOptions::default();
 
     let mut builder = Db::builder(path.clone(), object_store.clone()).with_settings(config);
 
     if let Some(memory_cache) = memory_cache {
-        builder = builder.with_db_cache(memory_cache);
+        builder = builder.with_db_cache(memory_cache, 0);
     }
 
     let db = Arc::new(builder.build().await.unwrap());
@@ -99,6 +96,7 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
         args.key_gen_supplier(),
         args.val_len,
         write_options,
+        args.await_durable,
         args.concurrency,
         args.num_rows,
         args.duration.map(|d| Duration::from_secs(d as u64)),
@@ -156,15 +154,12 @@ async fn exec_benchmark_transaction(
     args: BenchmarkTransactionArgs,
 ) {
     let (config, memory_cache) = args.db_args.config().unwrap();
-    let write_options = WriteOptions {
-        await_durable: args.await_durable,
-        ..Default::default()
-    };
+    let write_options = WriteOptions::default();
 
     let mut builder = Db::builder(path.clone(), object_store.clone()).with_settings(config);
 
     if let Some(memory_cache) = memory_cache {
-        builder = builder.with_db_cache(memory_cache);
+        builder = builder.with_db_cache(memory_cache, 0);
     }
 
     let db = Arc::new(builder.build().await.unwrap());
@@ -173,6 +168,7 @@ async fn exec_benchmark_transaction(
         args.key_gen_supplier(),
         args.val_len,
         write_options,
+        args.await_durable,
         args.concurrency,
         args.duration.map(|d| Duration::from_secs(d as u64)),
         args.transaction_size,

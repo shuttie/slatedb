@@ -24,6 +24,8 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::Manifest;
 use crate::tablestore::TableStore;
 use crate::utils::WatchableOnceCell;
+use crate::wal::slatedb::gc::{SlateDbWalGc, WalGcMode};
+use crate::wal::slatedb::store::WalTableStore;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use compacted_gc::CompactedGcTask;
@@ -40,18 +42,28 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tracing::instrument;
-use wal_gc::{WalGcMode, WalGcTask};
+use wal_gc::WalGcTask;
 
 mod compacted_gc;
 mod compactions_gc;
 mod detach_gc;
+mod filter;
 mod manifest_gc;
 pub mod stats;
 mod wal_gc;
 
+use crate::wal::WalGc;
+pub(crate) use filter::retain_allowed_by_gc_filter;
+pub use filter::GcFilter;
+
 pub(crate) const DEFAULT_MIN_AGE: Duration = Duration::from_secs(300);
-pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(600);
 pub(crate) const GC_TASK_NAME: &str = "garbage_collector";
+/// Maximum number of concurrent object-store deletes issued by a GC task's
+/// deletion pass. Deletes are independent single-object operations, so a small
+/// bounded fan-out keeps large backlogs tractable without overwhelming the
+/// object store.
+pub(crate) const GC_DELETE_CONCURRENCY: usize = 8;
 
 trait GcTask {
     fn resource(&self) -> &str;
@@ -220,10 +232,13 @@ impl GarbageCollector {
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         object_store: Arc<dyn ObjectStore>,
         options: GarbageCollectorOptions,
         recorder: &MetricsRecorderHelper,
         system_clock: Arc<dyn SystemClock>,
+        gc_filter: Option<Arc<dyn GcFilter>>,
+        wal_gc: Option<Arc<dyn WalGc>>,
     ) -> Self {
         let stats = Arc::new(GcStats::new(recorder));
         // The standalone GC lifecycle does not surface a closed result yet, so the
@@ -234,21 +249,37 @@ impl GarbageCollector {
             system_clock.clone(),
         ));
         let wal_gc_task = options.wal_options.map(|wal_options| {
+            let wal_gc = wal_gc.unwrap_or_else(|| {
+                Arc::new(SlateDbWalGc::new(
+                    wal_store.clone(),
+                    stats.clone(),
+                    WalGcMode::Regular,
+                    gc_filter.clone(),
+                    system_clock.clone(),
+                ))
+            });
             WalGcTask::new(
                 manifest_store.clone(),
-                table_store.clone(),
-                stats.clone(),
-                wal_options,
-                WalGcMode::Regular,
+                wal_gc,
+                WalGcMode::Regular.resource(),
+                wal_options.min_age,
+                wal_options.dry_run,
             )
         });
         let wal_fence_gc_task = options.wal_fence_options.map(|wal_fence_options| {
+            let wal_gc = Arc::new(SlateDbWalGc::new(
+                wal_store,
+                stats.clone(),
+                WalGcMode::Fence,
+                gc_filter.clone(),
+                system_clock.clone(),
+            ));
             WalGcTask::new(
                 manifest_store.clone(),
-                table_store.clone(),
-                stats.clone(),
-                wal_fence_options,
-                WalGcMode::Fence,
+                wal_gc,
+                WalGcMode::Fence.resource(),
+                wal_fence_options.min_age,
+                wal_fence_options.dry_run,
             )
         });
         let compacted_gc_task = options.compacted_options.map(|compacted_options| {
@@ -258,6 +289,7 @@ impl GarbageCollector {
                 table_store.clone(),
                 stats.clone(),
                 compacted_options,
+                gc_filter.clone(),
             )
         });
         let compactions_gc_task = options.compactions_options.map(|compactions_options| {
@@ -265,10 +297,18 @@ impl GarbageCollector {
                 compactions_store.clone(),
                 stats.clone(),
                 compactions_options,
+                gc_filter.clone(),
+                options.boundary_files_enabled,
             )
         });
         let manifest_gc_task = options.manifest_options.map(|manifest_options| {
-            ManifestGcTask::new(manifest_store.clone(), stats.clone(), manifest_options)
+            ManifestGcTask::new(
+                manifest_store.clone(),
+                stats.clone(),
+                manifest_options,
+                gc_filter.clone(),
+                options.boundary_files_enabled,
+            )
         });
         let detach_gc_task = options.detach_options.map(|detach_options| {
             DetachGcTask::new(
@@ -370,9 +410,17 @@ impl GarbageCollector {
     #[instrument(level = "debug", skip_all, fields(resource = task.resource()))]
     async fn run_gc_task<T: GcTask + std::fmt::Debug>(&self, task: &T) {
         if let Err(e) = self.remove_expired_checkpoints().await {
-            error!("error removing expired checkpoints [error={}]", e);
+            error!(
+                "error removing expired checkpoints [resource={}, error={:?}]",
+                task.resource(),
+                e,
+            );
         } else if let Err(e) = task.collect(self.system_clock.now()).await {
-            error!("error collecting compacted garbage [error={}]", e);
+            error!(
+                "error collecting garbage [resource={}, error={:?}]",
+                task.resource(),
+                e,
+            );
         }
     }
 
@@ -417,6 +465,10 @@ impl GarbageCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_cache_policy::BlockCachePolicy;
+    use crate::tablestore::TableStoreKind;
+    use crate::wal::slatedb::store::{WalFileId, WalTableStore};
+    use bytes::Bytes;
 
     use std::collections::HashSet;
     use std::{fs::OpenOptions, sync::Arc};
@@ -430,13 +482,13 @@ mod tests {
     use crate::compactor_state::{Compaction, CompactionSpec, SourceId};
     use crate::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
     use crate::error::SlateDBError;
-    use crate::object_stores::ObjectStores;
     use crate::paths::PathResolver;
     use crate::types::RowEntry;
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::metrics::{
         lookup_metric_with_labels, DefaultMetricsRecorder, MetricsRecorderHelper,
     };
+    use slatedb_common::ObjectMetadata;
 
     use crate::format::sst::SsTableFormat;
     use crate::{
@@ -448,9 +500,24 @@ mod tests {
         tablestore::TableStore,
     };
 
+    struct LocationGcFilter {
+        allowed_locations: HashSet<Path>,
+    }
+
+    #[async_trait]
+    impl GcFilter for LocationGcFilter {
+        async fn filter(&self, candidates: HashSet<ObjectMetadata>) -> HashSet<ObjectMetadata> {
+            candidates
+                .into_iter()
+                .filter(|metadata| self.allowed_locations.contains(&metadata.location))
+                .collect()
+        }
+    }
+
     #[tokio::test]
     async fn test_collect_garbage_manifest() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         // Create a manifest
         let state = ManifestCore::new();
@@ -487,6 +554,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
@@ -499,7 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_garbage_only_recent_manifests() {
-        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, _) = build_objects();
 
         // Create a manifest
         let mut stored_manifest = StoredManifest::create_new_db(
@@ -527,6 +595,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
@@ -540,7 +609,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_garbage_compactions_keeps_latest() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         StoredManifest::create_new_db(
             manifest_store.clone(),
@@ -584,6 +654,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
@@ -595,7 +666,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_garbage_compactions_respects_min_age() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         StoredManifest::create_new_db(
             manifest_store.clone(),
@@ -634,6 +706,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
@@ -647,7 +720,7 @@ mod tests {
 
     fn new_checkpoint(manifest_id: u64, expire_time: Option<DateTime<Utc>>) -> Checkpoint {
         Checkpoint {
-            id: uuid::Uuid::new_v4(),
+            id: Uuid::new_v4(),
             manifest_id,
             expire_time,
             create_time: DefaultSystemClock::default().now(),
@@ -687,7 +760,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_expired_checkpoints() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         // Manifest 1
         let state = ManifestCore::new();
@@ -732,6 +806,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
@@ -757,7 +832,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collector_should_not_clean_manifests_referenced_by_checkpoints() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         // Manifest 1
         let state = ManifestCore::new();
@@ -799,6 +875,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
@@ -823,7 +900,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_garbage_old_active_manifest() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         // Create a manifest
         let mut stored_manifest = StoredManifest::create_new_db(
@@ -865,6 +943,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
@@ -875,39 +954,44 @@ mod tests {
         assert_eq!(manifests[0].id, 2);
     }
 
-    async fn write_sst(
-        table_store: Arc<TableStore>,
-        table_id: &SsTableId,
+    async fn write_wal_sst(
+        wal_store: Arc<WalTableStore>,
+        wal_id: WalFileId,
     ) -> Result<(), SlateDBError> {
-        let mut sst = table_store.table_builder();
+        let mut sst = wal_store.table_builder();
         sst.add(RowEntry::new_value(b"key", b"value", 0)).await?;
-        let table1 = sst.build().await?;
-        table_store.write_sst(table_id, &table1, false).await?;
+        let table = sst.build().await?;
+        wal_store.write_sst(wal_id, &table).await?;
         Ok(())
+    }
+
+    async fn write_wal_fence(wal_store: Arc<WalTableStore>, wal_id: u64) {
+        wal_store.write_wal_fence(wal_id.into()).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_collect_garbage_wal_ssts() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
 
         // write a wal sst
-        let id1 = SsTableId::Wal(1);
-        write_sst(table_store.clone(), &id1).await.unwrap();
+        let id1 = WalFileId::from(1);
+        write_wal_sst(wal_store.clone(), id1).await.unwrap();
 
-        let id2 = SsTableId::Wal(2);
-        write_sst(table_store.clone(), &id2).await.unwrap();
+        let id2 = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), id2).await.unwrap();
 
         // Set the first WAL SST file to be a day old
         let now_minus_24h = set_modified(
             local_object_store.clone(),
-            &path_resolver.table_path(&SsTableId::Wal(1)),
+            &path_resolver.wal_sst_path(&WalFileId::from(1)),
             86400,
         );
 
         // Create a manifest
         let mut state = ManifestCore::new();
-        state.replay_after_wal_id = id2.unwrap_wal_id();
+        state.replay_after_wal_id = id2.value();
         StoredManifest::create_new_db(
             manifest_store.clone(),
             state.clone(),
@@ -917,7 +1001,7 @@ mod tests {
         .unwrap();
 
         // Verify that the WAL SST is there as expected
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 2);
         assert_eq!(wal_ssts[0].id, id1);
         assert_eq!(wal_ssts[1].id, id2);
@@ -927,7 +1011,7 @@ mod tests {
         let current_manifest = manifest_store.read_latest_manifest().await.unwrap();
         assert_eq!(
             current_manifest.manifest.core.replay_after_wal_id,
-            id2.unwrap_wal_id()
+            id2.value()
         );
 
         // Start the garbage collector
@@ -935,29 +1019,31 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
 
         // Verify that the first WAL was deleted and the second is kept
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 1);
         assert_eq!(wal_ssts[0].id, id2);
     }
 
     #[tokio::test]
     async fn test_do_not_remove_wals_referenced_by_active_checkpoints() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
 
-        let id1 = SsTableId::Wal(1);
-        write_sst(table_store.clone(), &id1).await.unwrap();
+        let id1 = WalFileId::from(1);
+        write_wal_sst(wal_store.clone(), id1).await.unwrap();
 
-        let id2 = SsTableId::Wal(2);
-        write_sst(table_store.clone(), &id2).await.unwrap();
+        let id2 = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), id2).await.unwrap();
 
-        let id3 = SsTableId::Wal(3);
-        write_sst(table_store.clone(), &id3).await.unwrap();
+        let id3 = WalFileId::from(3);
+        write_wal_sst(wal_store.clone(), id3).await.unwrap();
 
         // Manifest 1 with table 1 eligible for deletion
         let mut state = ManifestCore::new();
@@ -984,7 +1070,7 @@ mod tests {
         for i in 1..=3 {
             set_modified(
                 local_object_store.clone(),
-                &path_resolver.table_path(&SsTableId::Wal(i)),
+                &path_resolver.wal_sst_path(&WalFileId::from(i)),
                 86400,
             );
         }
@@ -994,13 +1080,14 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
 
         // Only the first table is deleted. The second is eligible,
         // but the reference in the checkpoint is still active.
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 2);
         assert_eq!(wal_ssts[0].id, id2);
         assert_eq!(wal_ssts[1].id, id3);
@@ -1008,42 +1095,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_collect_garbage_wal_ssts_and_keep_expired_last_compacted() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
 
         // write a wal sst
-        let id1 = SsTableId::Wal(1);
-        let mut sst1 = table_store.table_builder();
-        sst1.add(RowEntry::new_value(b"key", b"value", 0))
-            .await
-            .unwrap();
+        let id1 = WalFileId::from(1);
+        write_wal_sst(wal_store.clone(), id1).await.unwrap();
 
-        let table1 = sst1.build().await.unwrap();
-        table_store.write_sst(&id1, &table1, false).await.unwrap();
-
-        let id2 = SsTableId::Wal(2);
-        let mut sst2 = table_store.table_builder();
-        sst2.add(RowEntry::new_value(b"key", b"value", 0))
-            .await
-            .unwrap();
-        let table2 = sst2.build().await.unwrap();
-        table_store.write_sst(&id2, &table2, false).await.unwrap();
+        let id2 = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), id2).await.unwrap();
 
         // Set the both WAL SST file to be a day old
         let now_minus_24h_1 = set_modified(
             local_object_store.clone(),
-            &path_resolver.table_path(&SsTableId::Wal(1)),
+            &path_resolver.wal_sst_path(&WalFileId::from(1)),
             86400,
         );
         let now_minus_24h_2 = set_modified(
             local_object_store.clone(),
-            &path_resolver.table_path(&SsTableId::Wal(2)),
+            &path_resolver.wal_sst_path(&WalFileId::from(2)),
             86400,
         );
 
         // Create a manifest
         let mut state = ManifestCore::new();
-        state.replay_after_wal_id = id2.unwrap_wal_id();
+        state.replay_after_wal_id = id2.value();
         StoredManifest::create_new_db(
             manifest_store.clone(),
             state.clone(),
@@ -1053,7 +1130,7 @@ mod tests {
         .unwrap();
 
         // Verify that the WAL SST is there as expected
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 2);
         assert_eq!(wal_ssts[0].id, id1);
         assert_eq!(wal_ssts[1].id, id2);
@@ -1064,7 +1141,7 @@ mod tests {
         let current_manifest = manifest_store.read_latest_manifest().await.unwrap();
         assert_eq!(
             current_manifest.manifest.core.replay_after_wal_id,
-            id2.unwrap_wal_id()
+            id2.value()
         );
 
         // Start the garbage collector
@@ -1072,33 +1149,35 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             None,
         )
         .await;
 
         // Verify that the first WAL was deleted and the second is kept even though it's expired
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 1);
         assert_eq!(wal_ssts[0].id, id2);
     }
 
     #[tokio::test]
     async fn test_regular_wal_gc_does_not_delete_wal_fences() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
 
-        let fence_id = SsTableId::Wal(1);
-        table_store.write_wal_fence(1).await.unwrap();
+        let fence_id = WalFileId::from(1);
+        write_wal_fence(wal_store.clone(), 1).await;
 
-        let regular_wal_id = SsTableId::Wal(2);
-        write_sst(table_store.clone(), &regular_wal_id)
+        let regular_wal_id = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), regular_wal_id)
             .await
             .unwrap();
 
         for id in [fence_id, regular_wal_id] {
             set_modified(
                 local_object_store.clone(),
-                &path_resolver.table_path(&id),
+                &path_resolver.wal_sst_path(&id),
                 86400,
             );
         }
@@ -1125,20 +1204,25 @@ mod tests {
             compactions_options: None,
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
             compactions_store,
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &MetricsRecorderHelper::noop(),
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
 
         gc.run_gc_once().await;
 
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 1);
         assert_eq!(wal_ssts[0].id, fence_id);
         assert_eq!(wal_ssts[0].metadata.size, 0);
@@ -1146,24 +1230,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_wal_fence_gc_deletes_old_fences() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
 
-        let old_fence_id = SsTableId::Wal(1);
-        table_store.write_wal_fence(1).await.unwrap();
+        let old_fence_id = WalFileId::from(1);
+        write_wal_fence(wal_store.clone(), 1).await;
 
-        let regular_wal_id = SsTableId::Wal(2);
-        write_sst(table_store.clone(), &regular_wal_id)
+        let regular_wal_id = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), regular_wal_id)
             .await
             .unwrap();
 
-        let newer_fence_id = SsTableId::Wal(3);
-        table_store.write_wal_fence(3).await.unwrap();
+        let newer_fence_id = WalFileId::from(3);
+        write_wal_fence(wal_store.clone(), 3).await;
 
         for id in [old_fence_id, regular_wal_id, newer_fence_id] {
             set_modified(
                 local_object_store.clone(),
-                &path_resolver.table_path(&id),
+                &path_resolver.wal_sst_path(&id),
                 86400,
             );
         }
@@ -1190,6 +1275,8 @@ mod tests {
             compactions_options: None,
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
         let recorder = Arc::new(DefaultMetricsRecorder::new());
         let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
@@ -1197,22 +1284,25 @@ mod tests {
             manifest_store.clone(),
             compactions_store,
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &helper,
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
 
         gc.run_gc_once().await;
 
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         let wal_ids = wal_ssts.iter().map(|sst| sst.id).collect::<Vec<_>>();
         assert_eq!(wal_ids, vec![regular_wal_id]);
         assert!(wal_ssts[0].metadata.size > 0);
         assert_eq!(
             lookup_metric_with_labels(
                 &recorder,
-                crate::garbage_collector::stats::DELETED_COUNT,
+                stats::DELETED_COUNT,
                 &[("resource", "wal_fence")]
             ),
             Some(2)
@@ -1221,14 +1311,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_wal_fence_gc_deletes_single_old_fence() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
 
-        let fence_id = SsTableId::Wal(1);
-        table_store.write_wal_fence(1).await.unwrap();
+        let fence_id = WalFileId::from(1);
+        write_wal_fence(wal_store.clone(), 1).await;
         set_modified(
             local_object_store,
-            &path_resolver.table_path(&fence_id),
+            &path_resolver.wal_sst_path(&fence_id),
             86400,
         );
 
@@ -1254,41 +1345,47 @@ mod tests {
             compactions_options: None,
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
             compactions_store,
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &MetricsRecorderHelper::noop(),
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
 
         gc.run_gc_once().await;
 
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert!(wal_ssts.is_empty());
     }
 
     #[tokio::test]
     async fn test_regular_and_wal_fence_gc_run_independently() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
 
-        let old_fence_id = SsTableId::Wal(1);
-        table_store.write_wal_fence(1).await.unwrap();
+        let old_fence_id = WalFileId::from(1);
+        write_wal_fence(wal_store.clone(), 1).await;
 
-        let regular_wal_id_1 = SsTableId::Wal(2);
-        write_sst(table_store.clone(), &regular_wal_id_1)
+        let regular_wal_id_1 = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), regular_wal_id_1)
             .await
             .unwrap();
 
-        let newer_fence_id = SsTableId::Wal(3);
-        table_store.write_wal_fence(3).await.unwrap();
+        let newer_fence_id = WalFileId::from(3);
+        write_wal_fence(wal_store.clone(), 3).await;
 
-        let regular_wal_id_2 = SsTableId::Wal(4);
-        write_sst(table_store.clone(), &regular_wal_id_2)
+        let regular_wal_id_2 = WalFileId::from(4);
+        write_wal_sst(wal_store.clone(), regular_wal_id_2)
             .await
             .unwrap();
 
@@ -1300,7 +1397,7 @@ mod tests {
         ] {
             set_modified(
                 local_object_store.clone(),
-                &path_resolver.table_path(&id),
+                &path_resolver.wal_sst_path(&id),
                 86400,
             );
         }
@@ -1331,20 +1428,25 @@ mod tests {
             compactions_options: None,
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
         let gc = GarbageCollector::new(
             manifest_store.clone(),
             compactions_store,
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &MetricsRecorderHelper::noop(),
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
 
         gc.run_gc_once().await;
 
-        let wal_ssts = table_store.list_wal_ssts(..).await.unwrap();
+        let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 1);
         assert_eq!(wal_ssts[0].id, regular_wal_id_2);
         assert!(wal_ssts[0].metadata.size > 0);
@@ -1363,7 +1465,8 @@ mod tests {
     /// are deleted.
     #[tokio::test]
     async fn test_collect_garbage_compacted_ssts() {
-        let (manifest_store, compactions_store, table_store, _local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, _local_object_store) =
+            build_objects();
         // Use ULID timestamps to model "expired" vs "unexpired" SSTs relative to the
         // compacted GC min_age of 1h.
         let now = DefaultSystemClock::default().now();
@@ -1392,14 +1495,16 @@ mod tests {
             .l0
             .push_back(SsTableView::identity(active_expired_l0_sst_handle.clone()));
         // Dont' push inactive_expired_l0_sst_handle
-        Arc::make_mut(&mut state.tree).compacted.push(SortedRun {
-            id: 1,
-            // Don't add inactive_expired_sst_handle
-            sst_views: vec![
-                SsTableView::identity(active_sst_handle.clone()),
-                SsTableView::identity(active_expired_sst_handle.clone()),
-            ],
-        });
+        Arc::make_mut(&mut state.tree)
+            .compacted
+            .push(SortedRun::new(
+                1,
+                // Don't add inactive_expired_sst_handle
+                [
+                    SsTableView::identity(active_sst_handle.clone()),
+                    SsTableView::identity(active_expired_sst_handle.clone()),
+                ],
+            ));
         StoredManifest::create_new_db(
             manifest_store.clone(),
             state.clone(),
@@ -1431,7 +1536,7 @@ mod tests {
         assert_eq!(current_manifest.manifest.core.tree.compacted.len(), 1);
         assert_eq!(
             current_manifest.manifest.core.tree.compacted[0]
-                .sst_views
+                .sst_views()
                 .len(),
             2
         );
@@ -1441,6 +1546,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             Some(now),
         )
         .await;
@@ -1468,7 +1574,7 @@ mod tests {
         assert_eq!(current_manifest.manifest.core.tree.compacted.len(), 1);
         assert_eq!(
             current_manifest.manifest.core.tree.compacted[0]
-                .sst_views
+                .sst_views()
                 .len(),
             2
         );
@@ -1485,7 +1591,8 @@ mod tests {
     /// are deleted.
     #[tokio::test]
     async fn test_collect_garbage_compacted_ssts_respects_checkpoint_references() {
-        let (manifest_store, compactions_store, table_store, _local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, _local_object_store) =
+            build_objects();
         // Make all SSTs "expired" according to ULID timestamp so that min_age
         // does not prevent their collection; checkpoint references will gate GC.
         let now = DefaultSystemClock::default().now();
@@ -1512,14 +1619,18 @@ mod tests {
             .push_back(SsTableView::identity(
                 active_checkpoint_l0_sst_handle.clone(),
             ));
-        Arc::make_mut(&mut state.tree).compacted.push(SortedRun {
-            id: 1,
-            sst_views: vec![SsTableView::identity(active_sst_handle.clone())],
-        });
-        Arc::make_mut(&mut state.tree).compacted.push(SortedRun {
-            id: 2,
-            sst_views: vec![SsTableView::identity(active_checkpoint_sst_handle.clone())],
-        });
+        Arc::make_mut(&mut state.tree)
+            .compacted
+            .push(SortedRun::new(
+                1,
+                [SsTableView::identity(active_sst_handle.clone())],
+            ));
+        Arc::make_mut(&mut state.tree)
+            .compacted
+            .push(SortedRun::new(
+                2,
+                [SsTableView::identity(active_checkpoint_sst_handle.clone())],
+            ));
         let mut stored_manifest = StoredManifest::create_new_db(
             manifest_store.clone(),
             state.clone(),
@@ -1545,6 +1656,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             Some(now),
         )
         .await;
@@ -1570,6 +1682,7 @@ mod tests {
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             Some(now),
         )
         .await;
@@ -1591,10 +1704,12 @@ mod tests {
     /// # Returns
     /// A tuple containing the manifest store, compactions store, table store,
     /// and local object store
+    #[allow(clippy::type_complexity)]
     fn build_objects() -> (
         Arc<ManifestStore>,
         Arc<CompactionsStore>,
         Arc<TableStore>,
+        Arc<WalTableStore>,
         Arc<LocalFileSystem>,
     ) {
         let tempdir = tempfile::tempdir().unwrap().keep();
@@ -1608,16 +1723,25 @@ mod tests {
         let compactions_store = Arc::new(CompactionsStore::new(&path, local_object_store.clone()));
         let sst_format = SsTableFormat::default();
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(local_object_store.clone(), None),
+            local_object_store.clone(),
+            sst_format.clone(),
+            path.clone(),
+            None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
+        ));
+        let wal_store = Arc::new(WalTableStore::new(
+            local_object_store.clone(),
             sst_format,
             path,
-            None,
+            TableStoreKind::GC,
         ));
 
         (
             manifest_store,
             compactions_store,
             table_store,
+            wal_store,
             local_object_store,
         )
     }
@@ -1629,13 +1753,16 @@ mod tests {
     /// # Returns
     /// The handle to the SSTable that was created
     async fn create_sst(table_store: Arc<TableStore>, ts_ms: u64) -> SsTableHandle {
-        let sst_id = SsTableId::Compacted(ulid::Ulid::from_parts(ts_ms, 0));
+        let sst_id = SsTableId::from(ulid::Ulid::from_parts(ts_ms, 0));
         let mut sst = table_store.table_builder();
         sst.add(RowEntry::new_value(b"key", b"value", 0))
             .await
             .unwrap();
         let table = sst.build().await.unwrap();
-        table_store.write_sst(&sst_id, &table, false).await.unwrap()
+        table_store
+            .write_sst(&sst_id, &table, Some(Bytes::new()))
+            .await
+            .unwrap()
     }
 
     /// Set the modified time of a file to be a certain number of seconds ago.
@@ -1663,6 +1790,7 @@ mod tests {
     async fn assert_no_dangling_references(
         manifest_store: Arc<ManifestStore>,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
     ) {
         let manifest = manifest_store.read_latest_manifest().await.unwrap();
         let manifests = manifest_store
@@ -1670,13 +1798,13 @@ mod tests {
             .await
             .unwrap();
 
-        let wal_ssts = table_store
+        let wal_ssts = wal_store
             .list_wal_ssts(..)
             .await
             .unwrap()
             .iter()
             .map(|sst| sst.id)
-            .collect::<HashSet<SsTableId>>();
+            .collect::<HashSet<WalFileId>>();
         let compacted_ssts = table_store
             .list_compacted_ssts(..)
             .await
@@ -1689,7 +1817,7 @@ mod tests {
             let wal_sst_start_inclusive = manifest.core.replay_after_wal_id + 1;
             let wal_sst_end_exclusive = manifest.core.next_wal_sst_id;
             for wal_sst_id in wal_sst_start_inclusive..wal_sst_end_exclusive {
-                assert!(wal_ssts.contains(&SsTableId::Wal(wal_sst_id)));
+                assert!(wal_ssts.contains(&WalFileId::from(wal_sst_id)));
             }
 
             for view in &manifest.core.tree.l0 {
@@ -1697,7 +1825,7 @@ mod tests {
             }
 
             for sr in &manifest.core.tree.compacted {
-                for view in &sr.sst_views {
+                for view in sr.sst_views() {
                     assert!(compacted_ssts.contains(&view.sst.id));
                 }
             }
@@ -1708,12 +1836,14 @@ mod tests {
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         compaction_low_watermark_dt: Option<DateTime<Utc>>,
     ) {
         run_gc_once_with_recorder(
             manifest_store,
             compactions_store,
             table_store,
+            wal_store,
             compaction_low_watermark_dt,
             &MetricsRecorderHelper::noop(),
         )
@@ -1724,6 +1854,7 @@ mod tests {
         manifest_store: Arc<ManifestStore>,
         compactions_store: Arc<CompactionsStore>,
         table_store: Arc<TableStore>,
+        wal_store: Arc<WalTableStore>,
         compaction_low_watermark_dt: Option<DateTime<Utc>>,
         recorder: &MetricsRecorderHelper,
     ) {
@@ -1761,51 +1892,57 @@ mod tests {
 
         let gc_opts = GarbageCollectorOptions {
             manifest_options: Some(GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
-            wal_options: Some(crate::config::GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+            wal_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             wal_fence_options: None,
-            compacted_options: Some(crate::config::GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+            compacted_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
-            compactions_options: Some(crate::config::GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+            compactions_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
 
         let gc = GarbageCollector::new(
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
 
         gc.run_gc_once().await;
 
         // Verify reference integrity
-        assert_no_dangling_references(manifest_store, table_store).await;
+        assert_no_dangling_references(manifest_store, table_store, wal_store).await;
     }
 
     #[tokio::test]
     async fn test_handle_should_only_run_one_task_per_message() {
         use crate::dispatcher::MessageHandler;
 
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         // Create two manifests where the first is old enough to GC
         let mut stored_manifest = StoredManifest::create_new_db(
@@ -1835,38 +1972,43 @@ mod tests {
         let recorder = MetricsRecorderHelper::noop();
         let gc_opts = GarbageCollectorOptions {
             manifest_options: Some(GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             wal_options: Some(GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             wal_fence_options: None,
             compacted_options: Some(GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             compactions_options: Some(GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
 
         let mut gc = GarbageCollector::new(
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
 
         // Send a WAL GC message. Correct behavior: only WAL GC runs.
@@ -1885,7 +2027,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_gc_once_skips_disabled_manifest_gc() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         let mut stored_manifest = StoredManifest::create_new_db(
             manifest_store.clone(),
@@ -1909,33 +2052,38 @@ mod tests {
         let gc_opts = GarbageCollectorOptions {
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             wal_fence_options: None,
             compacted_options: Some(GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             compactions_options: Some(GarbageCollectorDirectoryOptions {
-                min_age: std::time::Duration::from_secs(3600),
+                min_age: Duration::from_secs(3600),
                 interval: None,
                 dry_run: false,
             }),
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
 
         let gc = GarbageCollector::new(
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
         gc.run_gc_once().await;
 
@@ -1951,7 +2099,7 @@ mod tests {
     async fn test_tickers_should_skip_disabled_gc_tasks() {
         use crate::dispatcher::MessageHandler;
 
-        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, _) = build_objects();
         let recorder = MetricsRecorderHelper::noop();
 
         let gc_opts = GarbageCollectorOptions {
@@ -1974,16 +2122,21 @@ mod tests {
             }),
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
 
         let mut gc = GarbageCollector::new(
             manifest_store,
             compactions_store,
             table_store,
+            wal_store,
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
 
         let intervals: Vec<_> = gc.tickers().into_iter().map(|def| def.interval).collect();
@@ -1999,7 +2152,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_gc_shutdown() {
-        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, _) = build_objects();
         let recorder = MetricsRecorderHelper::noop();
 
         let gc_opts = GarbageCollectorOptions {
@@ -2008,34 +2161,39 @@ mod tests {
                 interval: Some(Duration::from_secs(1)),
                 dry_run: false,
             }),
-            wal_options: Some(crate::config::GarbageCollectorDirectoryOptions {
+            wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(1)),
                 dry_run: false,
             }),
             wal_fence_options: None,
-            compacted_options: Some(crate::config::GarbageCollectorDirectoryOptions {
+            compacted_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(1)),
                 dry_run: false,
             }),
-            compactions_options: Some(crate::config::GarbageCollectorDirectoryOptions {
+            compactions_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(1)),
                 dry_run: false,
             }),
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
 
         let gc = GarbageCollector::new(
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
         gc.start().expect("failed to start garbage collector");
         gc.stop().await.expect("failed to stop garbage collector");
@@ -2043,7 +2201,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_record_gc_manifest_deleted_count() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         // given: two manifests, first one old enough to GC
         let mut stored_manifest = StoredManifest::create_new_db(
@@ -2070,6 +2229,7 @@ mod tests {
             manifest_store,
             compactions_store,
             table_store,
+            wal_store,
             None,
             &helper,
         )
@@ -2077,29 +2237,26 @@ mod tests {
 
         // then:
         assert_eq!(
-            lookup_metric_with_labels(
-                &recorder,
-                crate::garbage_collector::stats::DELETED_COUNT,
-                &[("resource", "manifest")]
-            ),
+            lookup_metric_with_labels(&recorder, stats::DELETED_COUNT, &[("resource", "manifest")]),
             Some(1)
         );
     }
 
     #[tokio::test]
     async fn test_should_record_gc_wal_deleted_count() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
 
         // given: two WAL SSTs, first one old enough to GC
-        let id1 = SsTableId::Wal(1);
-        write_sst(table_store.clone(), &id1).await.unwrap();
-        let id2 = SsTableId::Wal(2);
-        write_sst(table_store.clone(), &id2).await.unwrap();
-        set_modified(local_object_store, &path_resolver.table_path(&id1), 86400);
+        let id1 = WalFileId::from(1);
+        write_wal_sst(wal_store.clone(), id1).await.unwrap();
+        let id2 = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), id2).await.unwrap();
+        set_modified(local_object_store, &path_resolver.wal_sst_path(&id1), 86400);
 
         let mut state = ManifestCore::new();
-        state.replay_after_wal_id = id2.unwrap_wal_id();
+        state.replay_after_wal_id = id2.value();
         StoredManifest::create_new_db(
             manifest_store.clone(),
             state,
@@ -2115,6 +2272,7 @@ mod tests {
             manifest_store,
             compactions_store,
             table_store,
+            wal_store,
             None,
             &helper,
         )
@@ -2122,18 +2280,14 @@ mod tests {
 
         // then:
         assert_eq!(
-            lookup_metric_with_labels(
-                &recorder,
-                crate::garbage_collector::stats::DELETED_COUNT,
-                &[("resource", "wal")]
-            ),
+            lookup_metric_with_labels(&recorder, stats::DELETED_COUNT, &[("resource", "wal")]),
             Some(1)
         );
     }
 
     #[tokio::test]
     async fn test_should_record_gc_compacted_deleted_count() {
-        let (manifest_store, compactions_store, table_store, _) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, _) = build_objects();
         let now = DefaultSystemClock::default().now();
         let expired_ms = (now - TimeDelta::seconds(7200)).timestamp_millis() as u64;
         let unexpired_ms = (now - TimeDelta::seconds(1800)).timestamp_millis() as u64;
@@ -2147,10 +2301,9 @@ mod tests {
         Arc::make_mut(&mut state.tree)
             .l0
             .push_back(SsTableView::identity(active_l0_handle));
-        Arc::make_mut(&mut state.tree).compacted.push(SortedRun {
-            id: 1,
-            sst_views: vec![SsTableView::identity(active_handle)],
-        });
+        Arc::make_mut(&mut state.tree)
+            .compacted
+            .push(SortedRun::new(1, [SsTableView::identity(active_handle)]));
         // inactive_expired_handle is NOT in manifest -> eligible for GC
         StoredManifest::create_new_db(
             manifest_store.clone(),
@@ -2167,6 +2320,7 @@ mod tests {
             manifest_store,
             compactions_store,
             table_store.clone(),
+            wal_store,
             Some(now),
             &helper,
         )
@@ -2184,7 +2338,7 @@ mod tests {
         assert_eq!(
             lookup_metric_with_labels(
                 &recorder,
-                crate::garbage_collector::stats::DELETED_COUNT,
+                stats::DELETED_COUNT,
                 &[("resource", "compacted")]
             ),
             Some(1)
@@ -2193,7 +2347,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_record_gc_compactions_deleted_count() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
 
         // given: create a manifest and three compaction files, age them all
         StoredManifest::create_new_db(
@@ -2235,6 +2390,7 @@ mod tests {
             manifest_store,
             compactions_store.clone(),
             table_store,
+            wal_store,
             None,
             &helper,
         )
@@ -2248,7 +2404,7 @@ mod tests {
         assert_eq!(
             lookup_metric_with_labels(
                 &recorder,
-                crate::garbage_collector::stats::DELETED_COUNT,
+                stats::DELETED_COUNT,
                 &[("resource", "compactions")]
             ),
             Some(2)
@@ -2256,30 +2412,273 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dry_run_skips_directory_gc_deletes() {
-        let (manifest_store, compactions_store, table_store, local_object_store) = build_objects();
-        let path_resolver = PathResolver::new("/");
+    async fn test_gc_filter_can_reject_all_directory_gc_deletes() {
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
         let now = DefaultSystemClock::default().now();
         let expired_ms = (now - TimeDelta::seconds(7200)).timestamp_millis() as u64;
         let unexpired_ms = (now - TimeDelta::seconds(1800)).timestamp_millis() as u64;
 
-        let old_wal_id = SsTableId::Wal(1);
-        write_sst(table_store.clone(), &old_wal_id).await.unwrap();
-        let recent_wal_id = SsTableId::Wal(2);
-        write_sst(table_store.clone(), &recent_wal_id)
+        // Create regular WALs and a fence WAL, then age the GC-eligible ones.
+        let old_wal_id = WalFileId::from(1);
+        write_wal_sst(wal_store.clone(), old_wal_id).await.unwrap();
+        let recent_wal_id = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), recent_wal_id)
             .await
             .unwrap();
-        let old_fence_id = SsTableId::Wal(3);
-        table_store.write_wal_fence(3).await.unwrap();
+        let old_fence_id = WalFileId::from(3);
+        write_wal_fence(wal_store.clone(), 3).await;
 
         set_modified(
             local_object_store.clone(),
-            &path_resolver.table_path(&old_wal_id),
+            &path_resolver.wal_sst_path(&old_wal_id),
             86400,
         );
         set_modified(
             local_object_store.clone(),
-            &path_resolver.table_path(&old_fence_id),
+            &path_resolver.wal_sst_path(&old_fence_id),
+            86400,
+        );
+
+        // Create one inactive compacted SST that would normally be collected.
+        let inactive_expired_handle = create_sst(table_store.clone(), expired_ms).await;
+        let active_l0_handle = create_sst(table_store.clone(), unexpired_ms).await;
+
+        // Create two manifests so the older manifest is eligible for manifest GC.
+        let mut state = ManifestCore::new();
+        state.replay_after_wal_id = 4;
+        state.next_wal_sst_id = 5;
+        Arc::make_mut(&mut state.tree)
+            .l0
+            .push_back(SsTableView::identity(active_l0_handle));
+        let mut stored_manifest = StoredManifest::create_new_db(
+            manifest_store.clone(),
+            state,
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        stored_manifest
+            .update(stored_manifest.prepare_dirty().unwrap())
+            .await
+            .unwrap();
+        set_modified(
+            local_object_store.clone(),
+            &Path::from(format!("manifest/{:020}.manifest", 1)),
+            86400,
+        );
+
+        // Create compactions files and age all of them so every non-latest file is eligible.
+        let mut stored_compactions = StoredCompactions::create(
+            compactions_store.clone(),
+            stored_manifest.manifest().compactor_epoch,
+        )
+        .await
+        .unwrap();
+        let mut compactions_dirty = stored_compactions.prepare_dirty().unwrap();
+        compactions_dirty.value.insert(Compaction::new(
+            ulid::Ulid::from_parts(now.timestamp_millis() as u64, 0),
+            CompactionSpec::new(vec![SourceId::SortedRun(0)], 0),
+        ));
+        stored_compactions.update(compactions_dirty).await.unwrap();
+
+        let compaction_ids = compactions_store
+            .list_compactions(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect::<Vec<_>>();
+        for id in &compaction_ids {
+            set_modified(
+                local_object_store.clone(),
+                &Path::from(format!("compactions/{id:020}.compactions")),
+                86400,
+            );
+        }
+
+        // Use an empty location filter to reject every GC candidate.
+        let options = GarbageCollectorDirectoryOptions {
+            min_age: Duration::from_secs(3600),
+            interval: None,
+            dry_run: false,
+        };
+        let gc_opts = GarbageCollectorOptions {
+            manifest_options: Some(options),
+            wal_options: Some(options),
+            wal_fence_options: Some(options),
+            compacted_options: Some(options),
+            compactions_options: Some(options),
+            detach_options: None,
+            metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
+        };
+        let recorder = MetricsRecorderHelper::noop();
+        let gc = GarbageCollector::new(
+            manifest_store.clone(),
+            compactions_store.clone(),
+            table_store.clone(),
+            wal_store.clone(),
+            Arc::new(object_store::memory::InMemory::new()),
+            gc_opts,
+            &recorder,
+            Arc::new(DefaultSystemClock::default()),
+            Some(Arc::new(LocationGcFilter {
+                allowed_locations: HashSet::new(),
+            })),
+            None,
+        );
+
+        // Run every directory GC task with candidates present for each task type.
+        gc.run_gc_once().await;
+
+        // The filter should prevent manifest deletion.
+        let manifests = manifest_store.list_manifests(..).await.unwrap();
+        assert_eq!(manifests.len(), 2);
+
+        // The filter should prevent both WAL and fence WAL deletion.
+        let wal_ids = wal_store
+            .list_wal_ssts(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect::<HashSet<_>>();
+        assert!(wal_ids.contains(&old_wal_id));
+        assert!(wal_ids.contains(&recent_wal_id));
+        assert!(wal_ids.contains(&old_fence_id));
+
+        // The filter should prevent compacted SST deletion.
+        let compacted_ids = table_store
+            .list_compacted_ssts(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect::<HashSet<_>>();
+        assert!(compacted_ids.contains(&inactive_expired_handle.id));
+
+        // The filter should prevent compactions file deletion.
+        assert_eq!(
+            compactions_store.list_compactions(..).await.unwrap().len(),
+            compaction_ids.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gc_filter_allows_subset_and_stats_count_successful_deletes() {
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
+
+        // Create three old WALs below the replay boundary so all would be eligible
+        // without a filter. The middle one is the only filter-approved delete.
+        let rejected_before_wal_id = WalFileId::from(1);
+        let allowed_wal_id = WalFileId::from(2);
+        let rejected_after_wal_id = WalFileId::from(3);
+        for id in [
+            rejected_before_wal_id,
+            allowed_wal_id,
+            rejected_after_wal_id,
+        ] {
+            write_wal_sst(wal_store.clone(), id).await.unwrap();
+            set_modified(
+                local_object_store.clone(),
+                &path_resolver.wal_sst_path(&id),
+                86400,
+            );
+        }
+
+        // Keep the replay boundary above every test WAL so boundary retention
+        // cannot explain any remaining WAL.
+        let mut state = ManifestCore::new();
+        state.replay_after_wal_id = 4;
+        StoredManifest::create_new_db(
+            manifest_store.clone(),
+            state,
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+
+        let gc_opts = GarbageCollectorOptions {
+            manifest_options: None,
+            wal_options: Some(GarbageCollectorDirectoryOptions {
+                min_age: Duration::from_secs(3600),
+                interval: None,
+                dry_run: false,
+            }),
+            wal_fence_options: None,
+            compacted_options: None,
+            compactions_options: None,
+            detach_options: None,
+            metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
+        };
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), Default::default());
+        let gc = GarbageCollector::new(
+            manifest_store.clone(),
+            compactions_store,
+            table_store.clone(),
+            wal_store.clone(),
+            Arc::new(object_store::memory::InMemory::new()),
+            gc_opts,
+            &helper,
+            Arc::new(DefaultSystemClock::default()),
+            Some(Arc::new(LocationGcFilter {
+                allowed_locations: HashSet::from([path_resolver.wal_sst_path(&allowed_wal_id)]),
+            })),
+            None,
+        );
+
+        // Run WAL GC with a filter that permits only one of the eligible WALs.
+        gc.run_gc_once().await;
+
+        // Only the two filter-rejected WALs should remain, and stats should count one delete.
+        let wal_ids = wal_store
+            .list_wal_ssts(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect::<Vec<_>>();
+        assert_eq!(wal_ids, vec![rejected_before_wal_id, rejected_after_wal_id]);
+        assert_eq!(
+            lookup_metric_with_labels(&recorder, stats::DELETED_COUNT, &[("resource", "wal")]),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_skips_directory_gc_deletes() {
+        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+            build_objects();
+        let path_resolver = PathResolver::from_root("/");
+        let now = DefaultSystemClock::default().now();
+        let expired_ms = (now - TimeDelta::seconds(7200)).timestamp_millis() as u64;
+        let unexpired_ms = (now - TimeDelta::seconds(1800)).timestamp_millis() as u64;
+
+        let old_wal_id = WalFileId::from(1);
+        write_wal_sst(wal_store.clone(), old_wal_id).await.unwrap();
+        let recent_wal_id = WalFileId::from(2);
+        write_wal_sst(wal_store.clone(), recent_wal_id)
+            .await
+            .unwrap();
+        let old_fence_id = WalFileId::from(3);
+        write_wal_fence(wal_store.clone(), 3).await;
+
+        set_modified(
+            local_object_store.clone(),
+            &path_resolver.wal_sst_path(&old_wal_id),
+            86400,
+        );
+        set_modified(
+            local_object_store.clone(),
+            &path_resolver.wal_sst_path(&old_fence_id),
             86400,
         );
 
@@ -2350,16 +2749,21 @@ mod tests {
             compactions_options: Some(dry_run_options),
             detach_options: None,
             metric_level: None,
+            boundary_files_enabled: true,
+            object_store_max_retries: None,
         };
         let recorder = MetricsRecorderHelper::noop();
         let gc = GarbageCollector::new(
             manifest_store.clone(),
             compactions_store.clone(),
             table_store.clone(),
+            wal_store.clone(),
             Arc::new(object_store::memory::InMemory::new()),
             gc_opts,
             &recorder,
             Arc::new(DefaultSystemClock::default()),
+            None,
+            None,
         );
 
         gc.run_gc_once().await;
@@ -2367,7 +2771,7 @@ mod tests {
         let manifests = manifest_store.list_manifests(..).await.unwrap();
         assert_eq!(manifests.len(), 2);
 
-        let wal_ids = table_store
+        let wal_ids = wal_store
             .list_wal_ssts(..)
             .await
             .unwrap()

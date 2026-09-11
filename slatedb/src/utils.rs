@@ -27,6 +27,24 @@ use std::collections::VecDeque;
 
 static EMPTY_KEY: Bytes = Bytes::new();
 
+/// Whether the object store holds the main data path or the WAL.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ObjectStoreType {
+    /// The primary object store (SSTs, manifests, compacted data).
+    Main,
+    /// The dedicated WAL object store, when configured separately.
+    Wal,
+}
+
+impl ObjectStoreType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::Wal => "wal",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WatchableOnceCell<T: Clone> {
     rx: tokio::sync::watch::Receiver<Option<T>>,
@@ -134,6 +152,7 @@ pub(crate) fn merge_options<T>(
 /// ## Arguments
 /// - `table_store`: Table store for reading the SST index and blocks.
 /// - `output_sst`: Output SST already written for a compaction being resumed.
+/// - `segment`: Segment containing the output SST.
 ///
 /// ## Returns
 /// - `Ok(Some((Bytes, u64)))`: last key and sequence number from the final block.
@@ -144,15 +163,24 @@ pub(crate) fn merge_options<T>(
 pub(crate) async fn last_written_key_and_seq(
     table_store: Arc<TableStore>,
     output_sst: &SsTableHandle,
+    segment: &Bytes,
 ) -> Result<Option<(Bytes, u64)>, SlateDBError> {
-    let index = table_store.read_index(output_sst, false).await?;
+    let index = table_store
+        .read_index(output_sst, false, Some(segment.clone()))
+        .await?;
     let num_blocks = index.borrow().block_meta().len();
     if num_blocks == 0 {
         return Ok(None);
     }
     let last_block_idx = num_blocks - 1;
     let mut blocks = table_store
-        .read_blocks_using_index(output_sst, index, last_block_idx..last_block_idx + 1, false)
+        .read_blocks_using_index(
+            output_sst,
+            index,
+            last_block_idx..last_block_idx + 1,
+            false,
+            Some(segment.clone()),
+        )
         .await?;
     let Some(block) = blocks.pop_front() else {
         return Ok(None);
@@ -390,7 +418,7 @@ pub(crate) fn sign_extend(val: u32, bits: u8) -> i32 {
 /// Returns:
 /// - The effective max parallelism.
 pub(crate) fn compute_max_parallel(l0_count: usize, srs: &[SortedRun], cap: usize) -> usize {
-    let total_ssts = l0_count + srs.iter().map(|sr| sr.sst_views.len()).sum::<usize>();
+    let total_ssts = l0_count + srs.iter().map(|sr| sr.sst_views().len()).sum::<usize>();
     total_ssts.min(cap).max(1)
 }
 
@@ -416,7 +444,7 @@ pub(crate) fn estimate_bytes_before_key(sorted_runs: &[SortedRun], key: &Bytes) 
                 return 0;
             };
             sorted_run
-                .sst_views
+                .sst_views()
                 .iter()
                 .take(idx)
                 .map(|sst| sst.estimate_size())
@@ -454,7 +482,7 @@ where
     I::Item: Send,
     T: Send,
     F: Fn(I::Item) -> Fut + Send,
-    Fut: std::future::Future<Output = Result<Option<T>, SlateDBError>> + Send,
+    Fut: Future<Output = Result<Option<T>, SlateDBError>> + Send,
 {
     let mut out = VecDeque::new();
 
@@ -522,11 +550,8 @@ pub(crate) fn panic_string(panic: &Box<dyn Any + Send>) -> String {
 /// - (Err(SlateDBError::BackgroundTaskPanic), Some(payload)) if the task panicked
 pub(crate) fn split_unwind_result(
     name: String,
-    unwind_result: Result<Result<(), SlateDBError>, Box<dyn std::any::Any + Send>>,
-) -> (
-    Result<(), SlateDBError>,
-    Option<Box<dyn std::any::Any + Send>>,
-) {
+    unwind_result: Result<Result<(), SlateDBError>, Box<dyn Any + Send>>,
+) -> (Result<(), SlateDBError>, Option<Box<dyn Any + Send>>) {
     match unwind_result {
         Ok(result) => (result, None),
         Err(payload) => (Err(SlateDBError::BackgroundTaskPanic(name)), Some(payload)),
@@ -552,10 +577,7 @@ pub(crate) fn split_unwind_result(
 pub(crate) fn split_join_result(
     name: String,
     join_result: Result<Result<(), SlateDBError>, tokio::task::JoinError>,
-) -> (
-    Result<(), SlateDBError>,
-    Option<Box<dyn std::any::Any + Send>>,
-) {
+) -> (Result<(), SlateDBError>, Option<Box<dyn Any + Send>>) {
     match join_result {
         Ok(task_result) => (task_result, None),
         Err(join_error) => {
@@ -662,7 +684,7 @@ pub(crate) async fn preload_cache_from_manifest(
         Some(PreloadLevel::AllSst) => {
             let all_sst_paths: Vec<object_store::path::Path> = core
                 .all_sst_views()
-                .map(|view| path_resolver.table_path(&view.sst.id))
+                .map(|view| path_resolver.sst_path(&view.sst.id))
                 .collect();
             if !all_sst_paths.is_empty() {
                 if let Err(e) = cached_obj_store
@@ -677,7 +699,7 @@ pub(crate) async fn preload_cache_from_manifest(
             let l0_sst_paths: Vec<object_store::path::Path> = core
                 .trees()
                 .flat_map(|tree| tree.l0.iter())
-                .map(|view| path_resolver.table_path(&view.sst.id))
+                .map(|view| path_resolver.sst_path(&view.sst.id))
                 .collect();
             if !l0_sst_paths.is_empty() {
                 if let Err(e) = cached_obj_store
@@ -843,7 +865,7 @@ mod tests {
             ..Default::default()
         };
         SsTableView::identity(SsTableHandle::new(
-            SsTableId::Compacted(Ulid::new()),
+            SsTableId::from(Ulid::new()),
             SST_FORMAT_VERSION_LATEST,
             info,
         ))
@@ -1109,7 +1131,11 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let _sst1 = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::from(Ulid::new()),
+                &encoded_sst,
+                Some(Bytes::new()),
+            )
             .await
             .unwrap();
 
@@ -1124,14 +1150,19 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let sst2 = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::from(Ulid::new()),
+                &encoded_sst,
+                Some(Bytes::new()),
+            )
             .await
             .unwrap();
 
-        let (last_key, last_seq) = last_written_key_and_seq(table_store.clone(), &sst2)
-            .await
-            .unwrap()
-            .expect("missing last entry");
+        let (last_key, last_seq) =
+            last_written_key_and_seq(table_store.clone(), &sst2, &Bytes::new())
+                .await
+                .unwrap()
+                .expect("missing last entry");
         assert_eq!(last_key, Bytes::from(b"z".as_slice()));
         assert_eq!(last_seq, 4);
     }
@@ -1162,15 +1193,20 @@ mod tests {
             .unwrap();
         let encoded_sst = sst_builder.build().await.unwrap();
         let sst = table_store
-            .write_sst(&SsTableId::Compacted(Ulid::new()), &encoded_sst, false)
+            .write_sst(
+                &SsTableId::from(Ulid::new()),
+                &encoded_sst,
+                Some(Bytes::new()),
+            )
             .await
             .unwrap();
 
         // when: getting last written key and seq
-        let (last_key, last_seq) = last_written_key_and_seq(table_store.clone(), &sst)
-            .await
-            .unwrap()
-            .expect("missing last entry");
+        let (last_key, last_seq) =
+            last_written_key_and_seq(table_store.clone(), &sst, &Bytes::new())
+                .await
+                .unwrap()
+                .expect("missing last entry");
 
         // then: should return the last key and seq from the V1 formatted SST
         assert_eq!(last_key, Bytes::from(b"zzz".as_slice()));
@@ -1328,19 +1364,19 @@ mod tests {
 
     #[test]
     fn test_estimate_bytes_before_key() {
-        let run1 = SortedRun {
-            id: 1,
-            sst_views: vec![
+        let run1 = SortedRun::new(
+            1,
+            [
                 make_sst_view("a", 10),
                 make_sst_view("k", 20), // k < m < z, so only "a" counts
                 make_sst_view("z", 30),
             ],
-        };
-        let run2 = SortedRun {
-            id: 2,
+        );
+        let run2 = SortedRun::new(
+            2,
             // f < m < ..., so only "b" counts
-            sst_views: vec![make_sst_view("b", 40), make_sst_view("f", 50)],
-        };
+            [make_sst_view("b", 40), make_sst_view("f", 50)],
+        );
 
         let key = Bytes::from("m");
         let total = estimate_bytes_before_key(&[run1, run2], &key);
@@ -1485,8 +1521,7 @@ mod tests {
     #[test]
     fn test_split_unwind_result_ok_ok() {
         // Given: a successful unwind result
-        let unwind_result: Result<Result<(), SlateDBError>, Box<dyn std::any::Any + Send>> =
-            Ok(Ok(()));
+        let unwind_result: Result<Result<(), SlateDBError>, Box<dyn Any + Send>> = Ok(Ok(()));
 
         // When: we split the result
         let (result, payload) = super::split_unwind_result("test".to_string(), unwind_result);
@@ -1499,7 +1534,7 @@ mod tests {
     #[test]
     fn test_split_unwind_result_ok_error() {
         // Given: an unwind result with a task error
-        let unwind_result: Result<Result<(), SlateDBError>, Box<dyn std::any::Any + Send>> =
+        let unwind_result: Result<Result<(), SlateDBError>, Box<dyn Any + Send>> =
             Ok(Err(SlateDBError::Fenced));
 
         // When: we split the result
@@ -1514,7 +1549,7 @@ mod tests {
     fn test_split_unwind_result_panic() {
         // Given: an unwind result that panicked with a non-SlateDBError (e.g., a string)
         let panic_msg = "something went wrong";
-        let unwind_result: Result<Result<(), SlateDBError>, Box<dyn std::any::Any + Send>> =
+        let unwind_result: Result<Result<(), SlateDBError>, Box<dyn Any + Send>> =
             Err(Box::new(panic_msg));
 
         // When: we split the result

@@ -19,11 +19,9 @@ use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb::{Db, IsolationLevel, MergeOperator, MergeOperatorError};
 
+// Writes do not wait for durability by default.
 fn no_durable() -> WriteOptions {
-    WriteOptions {
-        await_durable: false,
-        ..Default::default()
-    }
+    WriteOptions::default()
 }
 
 /// A merge operator that concatenates operands onto the base value.
@@ -143,7 +141,7 @@ async fn test_multi_get_matches_get_loop_with_block_cache() {
     let cache = Arc::new(FoyerCache::new());
     let db = Db::builder("/tmp/test_multi_get_cache", object_store)
         .with_settings(layered_settings())
-        .with_db_cache(cache)
+        .with_db_cache(cache, 0)
         .build()
         .await
         .unwrap();

@@ -13,29 +13,63 @@
 
 use super::tracker::TrackerMessage;
 use crate::db::DbInner;
-use crate::db_state::{SsTableHandle, SsTableId};
+#[cfg(test)]
+use crate::db_state::SsTableHandle;
 use crate::db_status::ClosedResultWriter;
 use crate::dispatcher::{MessageHandler, MessageHandlerExecutor};
 use crate::error::SlateDBError;
-use crate::flush::EncodedSegmentSst;
+use crate::flush::SegmentedSstHandle;
 use crate::mem_table::ImmutableMemtable;
-use crate::utils::{IdGenerator, SafeSender};
+use crate::retrying_object_store::RetryingObjectStore;
+use crate::utils::SafeSender;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use log::{info, warn};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
+use ulid::Ulid;
 
 const UPLOADER_TASK_NAME: &str = "l0_sst_uploader";
 
-/// One immutable-memtable upload request submitted to the uploader. The
-/// worker allocates SST ids for each segment internally.
+// `BufWriter` wraps an `object_store::Error` inside `std::io::Error` through
+// `AsyncWrite`. Find the original error before applying the shared retry rule.
+// Without this step, `NotSupported` can retry forever.
+fn should_retry_upload_error(error: &SlateDBError) -> bool {
+    match error {
+        SlateDBError::ObjectStoreError(error) => RetryingObjectStore::should_retry(error),
+        SlateDBError::IoError(error) => {
+            let Some(source) = error.get_ref() else {
+                return true;
+            };
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(source);
+            while let Some(error) = source {
+                if let Some(error) = error.downcast_ref::<object_store::Error>() {
+                    return RetryingObjectStore::should_retry(error);
+                }
+                if let Some(error) = error.downcast_ref::<Arc<object_store::Error>>() {
+                    return RetryingObjectStore::should_retry(error);
+                }
+                source = error.source();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// One immutable-memtable upload request submitted to the uploader. Physical
+/// SST ids are allocated at dispatch (in sequence order) and carried here, so
+/// the parallel upload workers never mint ids out of publish order (RFC-0029).
 pub(crate) struct UploadJob {
     /// Immutable memtable to build into one or more SSTs.
     pub(crate) imm_memtable: Arc<ImmutableMemtable>,
+    /// Pre-allocated physical SST id per segment prefix. A segment that
+    /// retention prunes to empty simply leaves its id unused.
+    pub(crate) segment_sst_ids: BTreeMap<Bytes, Ulid>,
 }
 
 impl std::fmt::Debug for UploadJob {
@@ -45,19 +79,16 @@ impl std::fmt::Debug for UploadJob {
 }
 
 impl UploadJob {
-    /// Creates a new upload job.
-    pub(crate) fn new(imm_memtable: Arc<ImmutableMemtable>) -> Self {
-        Self { imm_memtable }
+    /// Creates a new upload job with pre-allocated segment SST ids.
+    pub(crate) fn new(
+        imm_memtable: Arc<ImmutableMemtable>,
+        segment_sst_ids: BTreeMap<Bytes, Ulid>,
+    ) -> Self {
+        Self {
+            imm_memtable,
+            segment_sst_ids,
+        }
     }
-}
-
-/// One uploaded SST from a memtable flush, tagged with the segment it
-/// belongs to (RFC-0024). An empty `prefix` denotes the compatibility-encoded
-/// `prefix=""` segment whose state lives in the manifest's top-level tree.
-#[derive(Clone)]
-pub(crate) struct SegmentedSstHandle {
-    pub(crate) prefix: Bytes,
-    pub(crate) sst_handle: SsTableHandle,
 }
 
 #[derive(Clone)]
@@ -93,6 +124,7 @@ impl UploadedMemtable {
             segments: vec![SegmentedSstHandle {
                 prefix: Bytes::new(),
                 sst_handle,
+                encoded_bytes: 0,
             }],
             first_seq,
             last_seq,
@@ -177,10 +209,10 @@ impl UploadHandler {
     }
 
     async fn upload_with_retry(&self, job: &UploadJob) -> Result<UploadedMemtable, SlateDBError> {
-        // Build once, retry only the upload. `write_sst` takes
-        // `&EncodedSsTable`, so the encoded SSTs stay alive for retries —
-        // no need to rebuild from the memtable on transient upload errors.
-        let built = self.db.build_imm_ssts(job.imm_memtable.table()).await?;
+        // Read the retention boundary once, before the first attempt
+        // below. Every retry reuses this same value, so every attempt
+        // keeps the same entries.
+        let min_retention_seq = self.db.compute_min_retention_seq();
         let first_seq = job
             .imm_memtable
             .table()
@@ -192,17 +224,33 @@ impl UploadHandler {
             .last_seq()
             .expect("flush of l0 with no entries");
 
-        // Upload all segment SSTs concurrently. `try_join_all` short-circuits
-        // on the first fatal error and drops the remaining futures; sibling
-        // uploads that already landed before the abort are left for the
-        // garbage collector to reclaim, since the worker allocates ids
-        // internally and they are not visible here for explicit cleanup.
-        let segments = futures::future::try_join_all(
-            built
-                .iter()
-                .map(|sst| self.upload_segment_sst(&job.imm_memtable, sst)),
-        )
-        .await?;
+        let segments = loop {
+            match self
+                .db
+                .stream_imm_ssts(
+                    job.imm_memtable.table(),
+                    min_retention_seq,
+                    &job.segment_sst_ids,
+                )
+                .await
+            {
+                Ok(segments) => break segments,
+                Err(e) if should_retry_upload_error(&e) => {
+                    // When the WAL is enabled and the database is shutting
+                    // down, give up immediately. The data is already durable
+                    // in the WAL and will be recovered on the next startup.
+                    if self.db.wal_enabled && self.db.check_closed().is_err() {
+                        info!("skipping l0 flush retry during shutdown [error={:?}]", e);
+                        return Err(e);
+                    }
+                    self.db.system_clock.sleep(self.retry_backoff).await;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+
+        let written_bytes: u64 = segments.iter().map(|s| s.encoded_bytes).sum();
+        self.db.db_stats.l0_flush_bytes.increment(written_bytes);
 
         Ok(UploadedMemtable {
             imm_memtable: Arc::clone(&job.imm_memtable),
@@ -210,47 +258,6 @@ impl UploadHandler {
             first_seq,
             last_seq,
         })
-    }
-
-    /// Upload a single segment SST with retry. Each retry reuses the
-    /// already-encoded SST so the upload loop never rebuilds from the
-    /// memtable.
-    async fn upload_segment_sst(
-        &self,
-        imm_memtable: &Arc<ImmutableMemtable>,
-        sst: &EncodedSegmentSst,
-    ) -> Result<SegmentedSstHandle, SlateDBError> {
-        let sst_id =
-            SsTableId::Compacted(self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()));
-        let written_bytes = sst.encoded.remaining_len() as u64;
-        loop {
-            match self
-                .db
-                .upload_sst(&sst_id, imm_memtable.table(), &sst.encoded, true)
-                .await
-            {
-                Ok(sst_handle) => {
-                    self.db.db_stats.l0_flush_bytes.increment(written_bytes);
-                    return Ok(SegmentedSstHandle {
-                        prefix: sst.prefix.clone(),
-                        sst_handle,
-                    });
-                }
-                Err(e) => {
-                    // When the WAL is enabled and the database is shutting
-                    // down, give up immediately. The data is already durable
-                    // in the WAL and will be recovered on the next startup.
-                    if self.db.wal_enabled && self.db.check_closed().is_err() {
-                        info!(
-                            "skipping l0 upload retry during shutdown [sst_id={:?}, error={:?}]",
-                            sst_id, e
-                        );
-                        return Err(e);
-                    }
-                    self.db.system_clock.sleep(self.retry_backoff).await;
-                }
-            }
-        }
     }
 }
 
@@ -282,22 +289,29 @@ impl MessageHandler<UploadJob> for UploadHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{TrackerMessage, UploadJob, Uploader};
+    use super::{should_retry_upload_error, TrackerMessage, UploadJob, Uploader};
+    use crate::block_cache_policy::BlockCachePolicy;
     use crate::config::Settings;
     use crate::db::DbInner;
-    use crate::db_state::SsTableView;
+    use crate::db_cache::test_utils::TestCache;
+    use crate::db_cache::CacheTarget;
+    use crate::db_cache::{CachedKey, DbCache};
+    use crate::db_state::{SsTableId, SsTableView};
     use crate::db_status::{ClosedResultWriter, DbStatusManager};
     use crate::error::SlateDBError;
     use crate::format::sst::SsTableFormat;
     use crate::iter::RowEntryIterator;
     use crate::manifest::ManifestCore;
-    use crate::object_stores::ObjectStores;
+    use crate::mem_table::ImmutableMemtable;
     use crate::paths::PathResolver;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
-    use crate::tablestore::TableStore;
+    use crate::tablestore::{TableStore, TableStoreKind};
     use crate::test_utils::FixedThreeBytePrefixExtractor;
     use crate::types::{RowEntry, ValueDeletable};
     use crate::utils::WatchableOnceCell;
+
+    use crate::wal::test_utils::FakeWalWriter;
+    use crate::wal::WalWriter;
     use bytes::Bytes;
     use fail_parallel::FailPointRegistry;
     use object_store::memory::InMemory;
@@ -306,10 +320,45 @@ mod tests {
     use slatedb_common::clock::{DefaultSystemClock, SystemClock};
     use slatedb_common::metrics::MetricsRecorderHelper;
     use slatedb_common::DbRand;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::runtime::Handle;
     use tokio::time::timeout;
+    use ulid::Ulid;
+
+    fn not_supported_error() -> object_store::Error {
+        object_store::Error::NotSupported {
+            source: Box::new(std::io::Error::other("not supported")),
+        }
+    }
+
+    #[test]
+    fn should_not_retry_not_supported_upload_error() {
+        let direct = SlateDBError::from(not_supported_error());
+        assert!(!should_retry_upload_error(&direct));
+
+        let wrapped = SlateDBError::from(std::io::Error::from(not_supported_error()));
+        assert!(!should_retry_upload_error(&wrapped));
+    }
+
+    #[test]
+    fn should_retry_io_error_without_object_store_source() {
+        let error = SlateDBError::from(std::io::Error::other("temporary failure"));
+        assert!(should_retry_upload_error(&error));
+    }
+
+    /// Build a pre-allocated id map for a test job, mirroring dispatch-time
+    /// allocation: one id per segment prefix, falling back to the empty prefix
+    /// when no extractor recorded segments. The tracker owns the real
+    /// allocation path; tests only need a valid map covering the built SSTs.
+    fn preallocate_ids(imm: &ImmutableMemtable) -> BTreeMap<Bytes, Ulid> {
+        let mut prefixes = imm.touched_segments();
+        if prefixes.is_empty() {
+            prefixes.insert(Bytes::new());
+        }
+        prefixes.into_iter().map(|p| (p, Ulid::new())).collect()
+    }
 
     async fn setup_db(path: &str, fp_registry: Arc<FailPointRegistry>) -> Arc<DbInner> {
         setup_db_with_extractor(path, fp_registry, None).await
@@ -319,6 +368,23 @@ mod tests {
         path: &str,
         fp_registry: Arc<FailPointRegistry>,
         segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    ) -> Arc<DbInner> {
+        setup_db_with_cache_policy(
+            path,
+            fp_registry,
+            segment_extractor,
+            None,
+            BlockCachePolicy::default(),
+        )
+        .await
+    }
+
+    async fn setup_db_with_cache_policy(
+        path: &str,
+        fp_registry: Arc<FailPointRegistry>,
+        segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+        cache: Option<Arc<dyn DbCache>>,
+        block_cache_policy: BlockCachePolicy,
     ) -> Arc<DbInner> {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let settings = Settings::default();
@@ -337,15 +403,18 @@ mod tests {
         .await
         .unwrap();
         let table_store = Arc::new(TableStore::new_with_fp_registry(
-            ObjectStores::new(Arc::clone(&object_store), None),
+            Arc::clone(&object_store),
             SsTableFormat::default(),
-            PathResolver::new(Path::from(path)),
+            PathResolver::from_root(Path::from(path)),
             fp_registry.clone(),
-            None,
+            cache,
+            TableStoreKind::Main,
+            block_cache_policy,
         ));
         let status_manager = DbStatusManager::new(0);
         let (write_tx, _) =
             crate::utils::SafeSender::unbounded_channel(status_manager.result_reader());
+        let wal_writer = Box::new(FakeWalWriter::new(0));
         Arc::new(
             DbInner::new(
                 settings,
@@ -357,10 +426,11 @@ mod tests {
                     &status_manager,
                 )),
                 write_tx,
+                wal_writer.observer(),
                 db_metrics,
                 fp_registry,
                 None,
-                status_manager,
+                Arc::new(status_manager),
                 segment_extractor,
             )
             .await
@@ -368,12 +438,7 @@ mod tests {
         )
     }
 
-    fn freeze_imm(
-        db: &DbInner,
-        key: &[u8],
-        value: &[u8],
-        seq: u64,
-    ) -> Arc<crate::mem_table::ImmutableMemtable> {
+    fn freeze_imm(db: &DbInner, key: &[u8], value: &[u8], seq: u64) -> Arc<ImmutableMemtable> {
         let mut guard = db.state.write();
         guard.memtable().put(RowEntry::new_value(key, value, seq));
         guard.freeze_memtable(0);
@@ -382,7 +447,8 @@ mod tests {
 
     fn next_upload_job(db: &DbInner, key: &[u8], value: &[u8], seq: u64) -> UploadJob {
         let imm_memtable = freeze_imm(db, key, value, seq);
-        UploadJob::new(imm_memtable)
+        let segment_sst_ids = preallocate_ids(&imm_memtable);
+        UploadJob::new(imm_memtable, segment_sst_ids)
     }
 
     struct TestUploader {
@@ -464,7 +530,7 @@ mod tests {
         assert!(segment.prefix.is_empty());
         let sst_view = SsTableView::identity(
             db.table_store
-                .open_sst(&segment.sst_handle.id)
+                .open_sst(&segment.sst_handle.id, Some(segment.prefix.clone()))
                 .await
                 .unwrap(),
         );
@@ -494,16 +560,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_retry_upload_failures_until_success() {
-        let fp_registry = Arc::new(FailPointRegistry::new());
-        fail_parallel::cfg(
-            Arc::clone(&fp_registry),
-            "write-compacted-sst-io-error",
-            "1*off->return",
+    async fn should_write_sst_to_preallocated_id() {
+        // The worker must write each segment SST to the id allocated at
+        // dispatch (carried in the job), not mint a fresh one (RFC-0029).
+        let db = setup_db(
+            "/tmp/test_parallel_l0_flush_uploader_preallocated_id",
+            Arc::new(FailPointRegistry::new()),
         )
-        .unwrap();
-        let db = setup_db("/tmp/test_parallel_l0_flush_uploader_retry", fp_registry).await;
+        .await;
         let job = next_upload_job(&db, b"key", b"value", 1);
+        let expected_id = *job
+            .segment_sst_ids
+            .get(&Bytes::new())
+            .expect("empty-prefix id should be pre-allocated");
 
         let test = start_test_uploader(&db);
         test.submit(job).unwrap();
@@ -515,8 +584,222 @@ mod tests {
         let TrackerMessage::UploadComplete(event) = msg else {
             panic!("expected UploadComplete");
         };
+        assert_eq!(event.segments.len(), 1);
+        assert_eq!(
+            event.segments[0].sst_handle.id,
+            SsTableId::from(expected_id)
+        );
+
+        test.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn should_apply_flush_cache_policy() {
+        let cache = Arc::new(TestCache::new());
+        let db = setup_db_with_cache_policy(
+            "/tmp/test_parallel_l0_flush_cache_policy",
+            Arc::new(FailPointRegistry::new()),
+            None,
+            Some(cache.clone()),
+            BlockCachePolicy::default().with_flush_targets(&[CacheTarget::Filters]),
+        )
+        .await;
+        let job = next_upload_job(&db, b"key", b"value", 1);
+        let test = start_test_uploader(&db);
+
+        test.submit(job).unwrap();
+        let msg = timeout(Duration::from_secs(5), test.tracker_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let TrackerMessage::UploadComplete(event) = msg else {
+            panic!("expected UploadComplete");
+        };
+        let handle = &event.segments[0].sst_handle;
+        let filter_key: CachedKey = (handle.id, handle.info.filter_offset).into();
+
+        assert!(cache.get_filter(&filter_key).await.unwrap().is_some());
+        assert_eq!(cache.entry_count(), 1);
+        test.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn should_retry_upload_failures_until_success() {
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        fail_parallel::cfg(
+            Arc::clone(&fp_registry),
+            "write-compacted-sst-io-error",
+            "1*return->off",
+        )
+        .unwrap();
+        let db = setup_db("/tmp/test_parallel_l0_flush_uploader_retry", fp_registry).await;
+        let job = next_upload_job(&db, b"key", b"value", 1);
+
+        let test = start_test_uploader(&db);
+        let started = std::time::Instant::now();
+        test.submit(job).unwrap();
+
+        let msg = timeout(Duration::from_secs(5), test.tracker_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= db.settings.manifest_poll_interval,
+            "expected the job to wait out at least one retry backoff before succeeding"
+        );
+        let TrackerMessage::UploadComplete(event) = msg else {
+            panic!("expected UploadComplete");
+        };
         assert_eq!(event.first_seq, 1);
         assert_eq!(event.last_seq, 1);
+
+        test.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn should_retry_the_whole_job_when_a_later_segment_fails() {
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        // First segment's write succeeds; second segment's write fails once;
+        // every write after that succeeds, including the retried first
+        // segment.
+        fail_parallel::cfg(
+            Arc::clone(&fp_registry),
+            "write-compacted-sst-io-error",
+            "1*off->1*return->off",
+        )
+        .unwrap();
+        let db = setup_db_with_extractor(
+            "/tmp/test_parallel_l0_flush_uploader_multi_segment_retry",
+            fp_registry,
+            Some(Arc::new(FixedThreeBytePrefixExtractor)),
+        )
+        .await;
+        {
+            let mut guard = db.state.write();
+            for (key, value, seq) in [(&b"aaa-1"[..], b"v1", 1), (&b"bbb-1"[..], b"v2", 2)] {
+                guard.memtable().put(RowEntry::new_value(key, value, seq));
+            }
+            guard
+                .memtable()
+                .table()
+                .record_touched_segments(std::collections::BTreeSet::from([
+                    Bytes::from_static(b"aaa"),
+                    Bytes::from_static(b"bbb"),
+                ]));
+            guard.freeze_memtable(0);
+        }
+        let imm_memtable = db
+            .state
+            .read()
+            .state()
+            .imm_memtable
+            .front()
+            .cloned()
+            .unwrap();
+        let segment_sst_ids = preallocate_ids(&imm_memtable);
+        let job = UploadJob::new(imm_memtable, segment_sst_ids);
+
+        let test = start_test_uploader(&db);
+        test.submit(job).unwrap();
+
+        let msg = timeout(Duration::from_secs(5), test.tracker_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let TrackerMessage::UploadComplete(event) = msg else {
+            panic!("expected UploadComplete");
+        };
+        let prefixes: Vec<&[u8]> = event.segments.iter().map(|s| s.prefix.as_ref()).collect();
+        assert_eq!(prefixes, vec![&b"aaa"[..], &b"bbb"[..]]);
+        for segment in &event.segments {
+            db.table_store
+                .open_sst(&segment.sst_handle.id, Some(segment.prefix.clone()))
+                .await
+                .expect("uploaded SST should be readable");
+        }
+
+        test.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn should_rebuild_from_memtable_when_a_mid_sst_block_write_fails() {
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        fail_parallel::cfg(
+            Arc::clone(&fp_registry),
+            "write-compacted-sst-io-error",
+            "1*off->1*return->off",
+        )
+        .unwrap();
+        let db = setup_db(
+            "/tmp/test_parallel_l0_flush_uploader_mid_block_retry",
+            fp_registry,
+        )
+        .await;
+
+        let value = vec![b'x'; 1024];
+        let entry_count = 32u64;
+        {
+            let mut guard = db.state.write();
+            for seq in 1..=entry_count {
+                let key = format!("key-{seq:04}");
+                guard
+                    .memtable()
+                    .put(RowEntry::new_value(key.as_bytes(), &value, seq));
+            }
+            guard.freeze_memtable(0);
+        }
+        let imm_memtable = db
+            .state
+            .read()
+            .state()
+            .imm_memtable
+            .front()
+            .cloned()
+            .unwrap();
+        let segment_sst_ids = preallocate_ids(&imm_memtable);
+        let job = UploadJob::new(imm_memtable, segment_sst_ids);
+
+        let test = start_test_uploader(&db);
+        let started = std::time::Instant::now();
+        test.submit(job).unwrap();
+
+        let msg = timeout(Duration::from_secs(5), test.tracker_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= db.settings.manifest_poll_interval,
+            "expected a mid-SST block write to fail and force one retry backoff"
+        );
+        let TrackerMessage::UploadComplete(event) = msg else {
+            panic!("expected UploadComplete");
+        };
+        assert_eq!(event.first_seq, 1);
+        assert_eq!(event.last_seq, entry_count);
+        assert_eq!(event.segments.len(), 1);
+
+        let sst_view = SsTableView::identity(
+            db.table_store
+                .open_sst(&event.segments[0].sst_handle.id, Some(Bytes::new()))
+                .await
+                .expect("rebuilt SST should be readable"),
+        );
+        let mut iter = SstIterator::new_owned_initialized(
+            ..,
+            sst_view,
+            Arc::clone(&db.table_store),
+            SstIteratorOptions::default(),
+        )
+        .await
+        .unwrap()
+        .expect("expected non-empty SST");
+        let mut seen = 0u64;
+        while let Some(entry) = iter.next().await.unwrap() {
+            seen += 1;
+            assert_eq!(entry.key.as_ref(), format!("key-{seen:04}").as_bytes());
+            assert_eq!(entry.seq, seen);
+        }
+        assert_eq!(seen, entry_count);
 
         test.shutdown().await;
     }
@@ -530,11 +813,9 @@ mod tests {
         .await;
         {
             let mut guard = db.state.write();
-            guard.memtable().put(crate::types::RowEntry::new_merge(
-                b"key",
-                b"merge_operand",
-                1,
-            ));
+            guard
+                .memtable()
+                .put(RowEntry::new_merge(b"key", b"merge_operand", 1));
             guard.freeze_memtable(0);
         }
         let imm_memtable = db
@@ -545,7 +826,8 @@ mod tests {
             .front()
             .cloned()
             .unwrap();
-        let job = UploadJob::new(imm_memtable);
+        let segment_sst_ids = preallocate_ids(&imm_memtable);
+        let job = UploadJob::new(imm_memtable, segment_sst_ids);
 
         let test = start_test_uploader(&db);
         test.submit(job).unwrap();
@@ -607,7 +889,7 @@ mod tests {
             let mut guard = db.state.write();
             guard
                 .memtable()
-                .put(crate::types::RowEntry::new_merge(b"key", b"operand", 1));
+                .put(RowEntry::new_merge(b"key", b"operand", 1));
             guard.freeze_memtable(0);
         }
         let imm_memtable = db
@@ -618,7 +900,8 @@ mod tests {
             .front()
             .cloned()
             .unwrap();
-        let bad_job = UploadJob::new(imm_memtable);
+        let segment_sst_ids = preallocate_ids(&imm_memtable);
+        let bad_job = UploadJob::new(imm_memtable, segment_sst_ids);
 
         let test = start_test_uploader(&db);
         test.submit(bad_job).unwrap();
@@ -711,7 +994,8 @@ mod tests {
             .front()
             .cloned()
             .unwrap();
-        let job = UploadJob::new(imm_memtable);
+        let segment_sst_ids = preallocate_ids(&imm_memtable);
+        let job = UploadJob::new(imm_memtable, segment_sst_ids);
 
         let test = start_test_uploader(&db);
         test.submit(job).unwrap();
@@ -736,7 +1020,7 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         for segment in &uploaded.segments {
             db.table_store
-                .open_sst(&segment.sst_handle.id)
+                .open_sst(&segment.sst_handle.id, Some(segment.prefix.clone()))
                 .await
                 .expect("uploaded SST should be readable");
             assert!(ids.insert(segment.sst_handle.id));
@@ -746,13 +1030,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_abort_concurrent_segment_uploads_on_shutdown_when_wal_enabled() {
-        // With multiple segments uploading concurrently via try_join_all,
-        // every per-segment retry loop must independently observe the
-        // shutdown signal and bail out — otherwise one stuck upload would
-        // hold the worker open. Configure the fail point to fail every
-        // upload and verify the worker reports an error after the db is
-        // closed.
+    async fn should_stop_retrying_multi_segment_job_on_shutdown_when_wal_enabled() {
+        // A multi-segment job streams and uploads all of its segments as one
+        // unit, retried as a whole on failure. Configure the fail point to
+        // fail every write and verify the single retry loop still observes
+        // the shutdown signal and gives up, rather than retrying forever.
         let fp_registry = Arc::new(FailPointRegistry::new());
         fail_parallel::cfg(
             Arc::clone(&fp_registry),
@@ -777,6 +1059,16 @@ mod tests {
             ] {
                 guard.memtable().put(RowEntry::new_value(key, value, seq));
             }
+            // The production write path stamps these inline; this test
+            // bypasses that, so record explicitly.
+            guard
+                .memtable()
+                .table()
+                .record_touched_segments(std::collections::BTreeSet::from([
+                    Bytes::from_static(b"aaa"),
+                    Bytes::from_static(b"bbb"),
+                    Bytes::from_static(b"ccc"),
+                ]));
             guard.freeze_memtable(0);
         }
         let imm_memtable = db
@@ -787,7 +1079,8 @@ mod tests {
             .front()
             .cloned()
             .unwrap();
-        let job = UploadJob::new(imm_memtable);
+        let segment_sst_ids = preallocate_ids(&imm_memtable);
+        let job = UploadJob::new(imm_memtable, segment_sst_ids);
 
         let test = start_test_uploader(&db);
         test.submit(job).unwrap();

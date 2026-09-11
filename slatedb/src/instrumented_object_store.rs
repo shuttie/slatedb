@@ -15,6 +15,13 @@
 //! so each `InstrumentedObjectStore` instance is constructed with one
 //! specific (component, type) pair. The cross-product of these two
 //! dimensions lets operators slice metrics by either axis.
+//!
+//! Note: if the wrapped `ObjectStore` is itself a wrapper like
+//! `CachedObjectStore`, the metrics count the calls into that wrapper, not
+//! the traffic it generates against the underlying store. A cache hit is
+//! counted as one request, and requests the cache makes internally to fill a
+//! miss are not counted at all.
+
 // `Instant` is intentionally used here for monotonic elapsed-time measurement.
 // SlateDB's clock abstraction is for wall-clock timestamps, not request timing.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -34,7 +41,7 @@ use object_store::{
 };
 use slatedb_common::metrics::MetricsRecorderHelper;
 
-use crate::object_stores::ObjectStoreType;
+use crate::utils::ObjectStoreType;
 
 /// Which SlateDB component is issuing object store requests.
 ///
@@ -276,7 +283,7 @@ pub mod stats {
     };
 
     use crate::instrumented_object_store::ObjectStoreComponent;
-    use crate::object_stores::ObjectStoreType;
+    use crate::utils::ObjectStoreType;
 
     macro_rules! object_store_stat_name {
         ($suffix:expr) => {
@@ -462,9 +469,9 @@ mod tests {
         get_labels, ERROR_COUNT, REQUEST_COUNT, REQUEST_DURATION_SECONDS,
     };
     use crate::instrumented_object_store::{InstrumentedObjectStore, ObjectStoreComponent};
-    use crate::object_stores::ObjectStoreType;
     use crate::retrying_object_store::RetryingObjectStore;
     use crate::test_utils::FlakyObjectStore;
+    use crate::utils::ObjectStoreType;
     use slatedb_common::DbRand;
 
     fn histogram_count(
@@ -651,6 +658,7 @@ mod tests {
             instrumented,
             Arc::new(DbRand::default()),
             Arc::new(DefaultSystemClock::default()),
+            None,
         );
 
         // when:

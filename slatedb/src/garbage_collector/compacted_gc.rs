@@ -9,11 +9,13 @@ use crate::{
     tablestore::TableStore,
 };
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use log::error;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use super::{GcStats, GcTask};
+use super::filter::retain_allowed_by_gc_filter;
+use super::{GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
 
 #[derive(Clone)]
 pub(crate) struct CompactedGcTask {
@@ -22,6 +24,7 @@ pub(crate) struct CompactedGcTask {
     table_store: Arc<TableStore>,
     stats: Arc<GcStats>,
     compacted_options: GarbageCollectorDirectoryOptions,
+    gc_filter: Option<Arc<dyn GcFilter>>,
 }
 
 impl std::fmt::Debug for CompactedGcTask {
@@ -39,6 +42,7 @@ impl CompactedGcTask {
         table_store: Arc<TableStore>,
         stats: Arc<GcStats>,
         compacted_options: GarbageCollectorDirectoryOptions,
+        gc_filter: Option<Arc<dyn GcFilter>>,
     ) -> Self {
         CompactedGcTask {
             manifest_store,
@@ -46,6 +50,7 @@ impl CompactedGcTask {
             table_store,
             stats,
             compacted_options,
+            gc_filter,
         }
     }
 
@@ -106,6 +111,32 @@ impl CompactedGcTask {
             None => DateTime::<Utc>::UNIX_EPOCH,
         }
     }
+
+    /// Deletes the given compacted SSTs from the table store.
+    ///
+    /// In case of dryrun, the actual deletion doesn't happen.
+    async fn maybe_delete_compacted_ssts(&self, sst_ids: Vec<SsTableId>) {
+        if self.compacted_options.dry_run {
+            if !sst_ids.is_empty() {
+                log::info!("dry run: skipping SST deletion [count={}]", sst_ids.len());
+            }
+            for id in sst_ids {
+                log::debug!("dry run: would delete SST but skipped [id={:?}]", id);
+            }
+            return;
+        }
+
+        futures::stream::iter(sst_ids)
+            .for_each_concurrent(GC_DELETE_CONCURRENCY, |id| async move {
+                log::info!("deleting SST [id={:?}]", id);
+                if let Err(e) = self.table_store.delete_sst(&id).await {
+                    error!("error deleting SST [id={:?}, error={}]", id, e);
+                } else {
+                    self.stats.gc_compacted_count.increment(1);
+                }
+            })
+            .await;
+    }
 }
 
 /// Collect every SST id referenced by `manifests`, across the unsegmented
@@ -118,7 +149,7 @@ fn collect_active_ssts<'a>(manifests: impl Iterator<Item = &'a Manifest>) -> Has
                 active.insert(view.sst.id);
             }
             for sr in tree.compacted.iter() {
-                for view in sr.sst_views.iter() {
+                for view in sr.sst_views() {
                     active.insert(view.sst.id);
                 }
             }
@@ -152,7 +183,7 @@ fn newest_l0_dt(manifest: &Manifest) -> DateTime<Utc> {
             if !tree.l0.is_empty() {
                 tree.l0
                     .iter()
-                    .map(|view| DateTime::<Utc>::from(view.sst.id.unwrap_compacted_id().datetime()))
+                    .map(|view| DateTime::<Utc>::from(view.sst.id.value().datetime()))
                     .max()
             } else {
                 tree.last_compacted_l0_sst_view_id
@@ -206,37 +237,24 @@ impl GcTask for CompactedGcTask {
             compaction_low_watermark_dt,
             newest_l0_dt,
         );
-        let sst_ids_to_delete = self
+        let ssts_to_delete = self
             .table_store
             // List all SSTs in the table store
             .list_compacted_ssts(..)
             .await?
             .into_iter()
-            .map(|sst| sst.id)
             // Filter out SSTs that were more recently created than the cutoff_dt
-            .filter(|id| DateTime::<Utc>::from(id.unwrap_compacted_id().datetime()) < cutoff_dt)
+            .filter(|sst| DateTime::<Utc>::from(sst.id.value().datetime()) < cutoff_dt)
             // Filter out SSTs that are active in the manifest (including actively checkpointed SSTs)
-            .filter(|id| !active_ssts.contains(id))
+            .filter(|sst| !active_ssts.contains(&sst.id))
+            .collect::<Vec<_>>();
+        let ssts_to_delete = retain_allowed_by_gc_filter(&self.gc_filter, ssts_to_delete).await;
+        let sst_ids_to_delete = ssts_to_delete
+            .into_iter()
+            .map(|sst| sst.id)
             .collect::<Vec<_>>();
 
-        if self.compacted_options.dry_run && !sst_ids_to_delete.is_empty() {
-            log::info!(
-                "dry run: skipping SST deletion [count={}]",
-                sst_ids_to_delete.len()
-            );
-        }
-        for id in sst_ids_to_delete {
-            if self.compacted_options.dry_run {
-                log::debug!("dry run: would delete SST but skipped [id={:?}]", id);
-                continue;
-            }
-            log::info!("deleting SST [id={:?}]", id);
-            if let Err(e) = self.table_store.delete_sst(&id).await {
-                error!("error deleting SST [id={:?}, error={}]", id, e);
-            } else {
-                self.stats.gc_compacted_count.increment(1);
-            }
-        }
+        self.maybe_delete_compacted_ssts(sst_ids_to_delete).await;
 
         Ok(())
     }
@@ -249,17 +267,22 @@ impl GcTask for CompactedGcTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_cache_policy::BlockCachePolicy;
+    use crate::cached_object_store::policy::CachePutConfig;
+    use crate::cached_object_store::stats::CachedObjectStoreStats;
+    use crate::cached_object_store::{CachedObjectStore, FsCacheStorage};
     use crate::compactions_store::{CompactionsStore, StoredCompactions};
     use crate::compactor_state::{Compaction, CompactionSpec, SourceId};
     use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
     use crate::format::sst::{SsTableFormat, SST_FORMAT_VERSION_LATEST};
     use crate::manifest::store::StoredManifest;
     use crate::manifest::{LsmTreeState, Manifest, ManifestCore, Segment};
-    use crate::object_stores::ObjectStores;
+    use crate::tablestore::TableStoreKind;
     use crate::test_utils::build_test_sst;
     use bytes::Bytes;
     use object_store::{memory::InMemory, path::Path};
     use slatedb_common::clock::DefaultSystemClock;
+    use slatedb_common::DbRand;
     use std::collections::{BTreeMap, VecDeque};
     use std::time::Duration;
 
@@ -267,13 +290,14 @@ mod tests {
     async fn test_compacted_gc_respects_min_age_cutoff() {
         // Object stores and table store
         let main_store = Arc::new(InMemory::new());
-        let object_stores = ObjectStores::new(main_store.clone(), None);
         let format = SsTableFormat::default();
         let table_store = Arc::new(TableStore::new(
-            object_stores,
+            main_store.clone(),
             format.clone(),
             Path::from("/root"),
             None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
         ));
 
         // Manifest store and initial manifest
@@ -305,24 +329,24 @@ mod tests {
         stored_compactions.update(compactions_dirty).await.unwrap();
 
         // Three SSTs with distinct ULID timestamps
-        let id_to_delete = SsTableId::Compacted(ulid::Ulid::from_parts(1_000, 0));
-        let id_within_min_age = SsTableId::Compacted(ulid::Ulid::from_parts(7_000, 0));
-        let id_active_recent = SsTableId::Compacted(ulid::Ulid::from_parts(8_000, 0));
+        let id_to_delete = SsTableId::from(ulid::Ulid::from_parts(1_000, 0));
+        let id_within_min_age = SsTableId::from(ulid::Ulid::from_parts(7_000, 0));
+        let id_active_recent = SsTableId::from(ulid::Ulid::from_parts(8_000, 0));
 
         let sst_to_delete = build_test_sst(&format, 1).await;
         let sst_within_min_age = build_test_sst(&format, 1).await;
         let sst_active_recent = build_test_sst(&format, 1).await;
 
         table_store
-            .write_sst(&id_to_delete, &sst_to_delete, false)
+            .write_sst(&id_to_delete, &sst_to_delete, Some(Bytes::new()))
             .await
             .unwrap();
         table_store
-            .write_sst(&id_within_min_age, &sst_within_min_age, false)
+            .write_sst(&id_within_min_age, &sst_within_min_age, Some(Bytes::new()))
             .await
             .unwrap();
         let active_handle = table_store
-            .write_sst(&id_active_recent, &sst_active_recent, false)
+            .write_sst(&id_active_recent, &sst_active_recent, Some(Bytes::new()))
             .await
             .unwrap();
 
@@ -350,6 +374,7 @@ mod tests {
             table_store.clone(),
             stats,
             opts,
+            None,
         );
 
         let utc_now = DateTime::<Utc>::from_timestamp_millis(10_000).unwrap();
@@ -371,13 +396,14 @@ mod tests {
     async fn test_compacted_gc_respects_manifest_most_recent_sst() {
         // Object stores and table store
         let main_store = Arc::new(InMemory::new());
-        let object_stores = ObjectStores::new(main_store.clone(), None);
         let format = SsTableFormat::default();
         let table_store = Arc::new(TableStore::new(
-            object_stores,
+            main_store.clone(),
             format.clone(),
             Path::from("/root"),
             None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
         ));
 
         // Manifest store and initial manifest
@@ -409,24 +435,24 @@ mod tests {
         stored_compactions.update(compactions_dirty).await.unwrap();
 
         // Three SSTs with distinct ULID timestamps
-        let id_to_delete = SsTableId::Compacted(ulid::Ulid::from_parts(1_000, 0));
-        let id_manifest = SsTableId::Compacted(ulid::Ulid::from_parts(3_000, 0));
-        let id_newer = SsTableId::Compacted(ulid::Ulid::from_parts(4_000, 0));
+        let id_to_delete = SsTableId::from(ulid::Ulid::from_parts(1_000, 0));
+        let id_manifest = SsTableId::from(ulid::Ulid::from_parts(3_000, 0));
+        let id_newer = SsTableId::from(ulid::Ulid::from_parts(4_000, 0));
 
         let sst_to_delete = build_test_sst(&format, 1).await;
         let sst_manifest = build_test_sst(&format, 1).await;
         let sst_newer = build_test_sst(&format, 1).await;
 
         table_store
-            .write_sst(&id_to_delete, &sst_to_delete, false)
+            .write_sst(&id_to_delete, &sst_to_delete, Some(Bytes::new()))
             .await
             .unwrap();
         let manifest_handle = table_store
-            .write_sst(&id_manifest, &sst_manifest, false)
+            .write_sst(&id_manifest, &sst_manifest, Some(Bytes::new()))
             .await
             .unwrap();
         table_store
-            .write_sst(&id_newer, &sst_newer, false)
+            .write_sst(&id_newer, &sst_newer, Some(Bytes::new()))
             .await
             .unwrap();
 
@@ -455,6 +481,7 @@ mod tests {
             table_store.clone(),
             stats,
             opts,
+            None,
         );
 
         let utc_now = DateTime::<Utc>::from_timestamp_millis(10_000).unwrap();
@@ -477,13 +504,14 @@ mod tests {
     async fn test_compacted_gc_respects_compaction_barrier() {
         // Object stores and table store
         let main_store = Arc::new(InMemory::new());
-        let object_stores = ObjectStores::new(main_store.clone(), None);
         let format = SsTableFormat::default();
         let table_store = Arc::new(TableStore::new(
-            object_stores,
+            main_store.clone(),
             format.clone(),
             Path::from("/root"),
             None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
         ));
 
         // Manifest store with empty DB
@@ -502,22 +530,22 @@ mod tests {
         let compactor_epoch = stored_manifest.manifest().compactor_epoch;
 
         // Three SSTs with distinct ULID timestamps
-        let id_to_delete = SsTableId::Compacted(ulid::Ulid::from_parts(1_000, 0)); // job 1
-        let id_barrier = SsTableId::Compacted(ulid::Ulid::from_parts(2_000, 0)); // job 2
-        let id_to_newer = SsTableId::Compacted(ulid::Ulid::from_parts(3_000, 0)); // job 2, too
+        let id_to_delete = SsTableId::from(ulid::Ulid::from_parts(1_000, 0)); // job 1
+        let id_barrier = SsTableId::from(ulid::Ulid::from_parts(2_000, 0)); // job 2
+        let id_to_newer = SsTableId::from(ulid::Ulid::from_parts(3_000, 0)); // job 2, too
         let sst_to_delete = build_test_sst(&format, 1).await;
         let sst_barrier = build_test_sst(&format, 1).await;
         let sst_to_newer = build_test_sst(&format, 1).await;
         table_store
-            .write_sst(&id_to_delete, &sst_to_delete, false)
+            .write_sst(&id_to_delete, &sst_to_delete, Some(Bytes::new()))
             .await
             .unwrap();
         table_store
-            .write_sst(&id_barrier, &sst_barrier, false)
+            .write_sst(&id_barrier, &sst_barrier, Some(Bytes::new()))
             .await
             .unwrap();
         let active_handle = table_store
-            .write_sst(&id_to_newer, &sst_to_newer, false)
+            .write_sst(&id_to_newer, &sst_to_newer, Some(Bytes::new()))
             .await
             .unwrap();
 
@@ -556,6 +584,7 @@ mod tests {
             table_store.clone(),
             stats,
             opts,
+            None,
         );
 
         // Run GC at a fixed time and verify only the SST strictly
@@ -579,13 +608,14 @@ mod tests {
     #[tokio::test]
     async fn test_compacted_gc_skips_running_compaction_output_without_watermark() {
         let main_store = Arc::new(InMemory::new());
-        let object_stores = ObjectStores::new(main_store.clone(), None);
         let format = SsTableFormat::default();
         let table_store = Arc::new(TableStore::new(
-            object_stores,
+            main_store.clone(),
             format.clone(),
             Path::from("/root"),
             None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
         ));
 
         // Manifest with an L0 newer than the compaction output.
@@ -611,9 +641,13 @@ mod tests {
         .unwrap();
 
         // Newest L0 in the manifest has a later timestamp (9_000ms).
-        let l0_id = SsTableId::Compacted(ulid::Ulid::from_parts(9_000, 0));
+        let l0_id = SsTableId::from(ulid::Ulid::from_parts(9_000, 0));
         let l0_handle = table_store
-            .write_sst(&l0_id, &build_test_sst(&format, 1).await, false)
+            .write_sst(
+                &l0_id,
+                &build_test_sst(&format, 1).await,
+                Some(Bytes::new()),
+            )
             .await
             .unwrap();
         let mut dirty_manifest = stored_manifest.prepare_dirty().unwrap();
@@ -624,12 +658,12 @@ mod tests {
 
         // Simulate a compaction that starts after GC reads compaction state, writes an
         // output SST (6_000ms), but hasn't updated the manifest yet.
-        let compaction_output_id = SsTableId::Compacted(ulid::Ulid::from_parts(6_000, 0));
+        let compaction_output_id = SsTableId::from(ulid::Ulid::from_parts(6_000, 0));
         table_store
             .write_sst(
                 &compaction_output_id,
                 &build_test_sst(&format, 1).await,
-                false,
+                Some(Bytes::new()),
             )
             .await
             .unwrap();
@@ -649,6 +683,7 @@ mod tests {
             table_store.clone(),
             stats,
             opts,
+            None,
         );
 
         let utc_now = DateTime::<Utc>::from_timestamp_millis(10_000).unwrap();
@@ -675,7 +710,7 @@ mod tests {
     fn view_at(seq: u64) -> SsTableView {
         let id = ulid_at(seq);
         SsTableView::identity(SsTableHandle::new(
-            SsTableId::Compacted(id),
+            SsTableId::from(id),
             SST_FORMAT_VERSION_LATEST,
             SsTableInfo::default(),
         ))
@@ -710,10 +745,7 @@ mod tests {
                     last_compacted_l0_sst_view_id: None,
                     last_compacted_l0_sst_id: None,
                     l0: VecDeque::from(vec![segment_l0.clone()]),
-                    compacted: vec![SortedRun {
-                        id: 0,
-                        sst_views: vec![segment_sr.clone()],
-                    }],
+                    compacted: vec![SortedRun::new(0, [segment_sr.clone()])],
                 }),
             }],
         );
@@ -807,5 +839,105 @@ mod tests {
     fn test_newest_l0_dt_unix_epoch_when_no_trees_contribute() {
         let manifest = manifest_with(LsmTreeState::default(), vec![]);
         assert_eq!(newest_l0_dt(&manifest), DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[tokio::test]
+    async fn test_compacted_gc_evicts_deleted_sst_from_object_store_cache() {
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let main_store = Arc::new(InMemory::new());
+        let cache_stats = Arc::new(CachedObjectStoreStats::new(&recorder));
+        let temp_dir = tempfile::Builder::new()
+            .prefix("gc_cache_evict_test_")
+            .tempdir()
+            .unwrap();
+        let part_size = 1024;
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            temp_dir.keep(),
+            None,
+            None,
+            cache_stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            1000,
+        ));
+        let cached_store = CachedObjectStore::new(
+            main_store.clone(),
+            cache_storage,
+            part_size,
+            CachePutConfig {
+                cache_on_flush: true,
+                cache_on_compaction: false,
+            },
+            cache_stats,
+        )
+        .unwrap();
+
+        let format = SsTableFormat::default();
+        // The GC store deletes through the cache; the Main store caches on write.
+        let gc_table_store = Arc::new(TableStore::new(
+            cached_store.clone(),
+            format.clone(),
+            Path::from("/root"),
+            None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
+        ));
+        let main_table_store = Arc::new(TableStore::new(
+            cached_store.clone(),
+            format.clone(),
+            Path::from("/root"),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+
+        // Written through the Main store so cache_on_flush admits it.
+        let id_to_delete = SsTableId::from(ulid::Ulid::from_parts(1_000, 0));
+        let sst = build_test_sst(&format, 1).await;
+        main_table_store
+            .write_sst(&id_to_delete, &sst, Some(Bytes::new()))
+            .await
+            .unwrap();
+
+        let location = gc_table_store
+            .list_compacted_ssts(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id_to_delete)
+            .expect("sst to delete should be listed")
+            .metadata
+            .location;
+        let entry = cached_store.cache_storage.entry(&location, part_size);
+        assert!(
+            !entry.cached_parts().await.unwrap().is_empty(),
+            "sst should be cached before delete"
+        );
+
+        // Call GC deletion directly, no need to test the decision here.
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from("/root"), main_store.clone()));
+        let compactions_store = Arc::new(CompactionsStore::new(
+            &Path::from("/root"),
+            main_store.clone(),
+        ));
+        let task = CompactedGcTask::new(
+            manifest_store,
+            compactions_store,
+            gc_table_store.clone(),
+            Arc::new(GcStats::new(&recorder)),
+            GarbageCollectorDirectoryOptions {
+                interval: None,
+                min_age: Duration::from_secs(5),
+                dry_run: false,
+            },
+            None,
+        );
+        task.maybe_delete_compacted_ssts(vec![id_to_delete]).await;
+
+        let entry = cached_store.cache_storage.entry(&location, part_size);
+        assert!(
+            entry.cached_parts().await.unwrap().is_empty(),
+            "sst should be evicted after delete"
+        );
     }
 }

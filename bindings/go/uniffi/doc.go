@@ -87,9 +87,9 @@
 // insertion, and scan fetch parallelism.
 //
 // For long-lived read-only access, open a [DbReader] with
-// [NewDbReaderBuilder]. A reader can be pinned to an existing checkpoint with
-// [DbReaderBuilder.WithCheckpointId], configured with [ReaderOptions], and
-// given a [MergeOperator] for merge-aware reads.
+// [NewDbReaderBuilder]. A reader's state selection can be configured with
+// [DbReaderBuilder.WithReaderMode] and [ReaderMode]. It can also be configured
+// with [ReaderOptions] and given a [MergeOperator] for merge-aware reads.
 //
 // [Db.Snapshot] creates a consistent read-only [DbSnapshot] from a writable
 // database handle.
@@ -100,14 +100,14 @@
 // [Db.Delete], and [Db.Merge], plus batch and durability controls through
 // [PutOptions], [MergeOptions], [WriteOptions], and [FlushOptions].
 //
-// [WriteHandle] reports metadata assigned to a successful write, including the
-// sequence number and creation timestamp.
+// [WriteHandle] reports metadata assigned to a successful write and exposes
+// [WriteHandle.AwaitDurable] for waiting until that specific write is durable.
 //
 // [WriteBatch] collects multiple mutations and applies them atomically through
 // [Db.Write] or [Db.WriteWithOptions]. Batches are single-use once submitted.
 //
 // TTL behavior is configured with [Ttl] implementations such as [TtlDefault],
-// [TtlNoExpiry], and [TtlExpireAfterTicks].
+// [TtlNoExpiry], and [TtlExpireAfterMillis].
 //
 // # Transactions
 //
@@ -135,13 +135,15 @@
 // interface. Rust-side logging can be forwarded into Go code with
 // [InitLogging] and a [LogCallback].
 //
-// # WAL Inspection
+// # Change Data Capture
 //
-// [NewWalReader] opens a [WalReader] for inspecting WAL files under a database
-// path. [WalReader.List] enumerates [WalFile] handles, [WalFile.Metadata]
-// returns object-store metadata, and [WalFile.Iterator] returns a
-// [WalFileIterator] that yields raw [RowEntry] values. This is primarily useful
-// for debugging, diagnostics, and low-level tooling.
+// [NewSlateDbWalReader] opens a [SlateDbWalReader] for live WAL streaming.
+// Call [SlateDbWalReader.Iterator] once with the first unconsumed WAL file ID,
+// then keep calling [SlateDbWalIterator.Next]. The iterator waits and polls
+// internally at the current tail. Persist every [WalRows.LastConsumedWalFileId],
+// including empty fence batches, and resume from the following ID after a
+// restart. [SlateDbWalReader.LastWalFileId] is available when a snapshot of the
+// current tail is useful, but is not needed to drive the stream.
 //
 // # Errors
 //
@@ -159,8 +161,8 @@
 //
 // Most exported handle types own a Rust-side resource and provide an explicit
 // `Destroy` method, including [ObjectStore], [DbBuilder], [Db], [DbReader],
-// [DbSnapshot], [DbTransaction], [DbIterator], [WalReader], [WalFile],
-// [WalFileIterator], [Settings], and [WriteBatch].
+// [DbSnapshot], [DbTransaction], [DbIterator], [SlateDbWalReader],
+// [SlateDbWalIterator], [Settings], and [WriteBatch].
 //
 // These handles install Go finalizers, but callers should not rely on garbage
 // collection for timely cleanup. Prefer calling `Destroy` explicitly when a
@@ -169,6 +171,7 @@
 // binding handle.
 //
 // Builders are single-use after `Build`. [WriteBatch] is single-use after
-// `Write`. Iterator `Next` methods return `nil` when exhausted, and transaction
-// commit methods may return `nil` when no write was emitted.
+// `Write`. Bounded iterator `Next` methods return `nil` when exhausted; the live
+// [SlateDbWalIterator] instead waits at the current tail. Transaction commit
+// methods may return `nil` when no write was emitted.
 package slatedb

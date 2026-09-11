@@ -13,17 +13,22 @@ mod logging;
 mod merge_operator;
 mod metrics;
 mod object_store;
+mod object_store_builder;
+mod runtime;
 mod settings;
 mod types;
 mod validation;
 mod wal_reader;
 mod write_batch;
+mod write_handle;
 
 pub use admin::Admin;
 pub use builder::{AdminBuilder, CloneBuilder, DbBuilder, DbReaderBuilder};
 pub use config::{
-    DurabilityLevel, FlushOptions, FlushType, IsolationLevel, IterationOrder, MergeOptions,
-    PutOptions, ReadOptions, ReaderOptions, ScanOptions, SstBlockSize, Ttl, WriteOptions,
+    CloseOptions, DurabilityLevel, FlushOptions, FlushType, GarbageCollectorDirectoryOptions,
+    GarbageCollectorOptions, GarbageCollectorScheduleOptions, IsolationLevel, IterationOrder,
+    MergeOptions, PutOptions, ReadOptions, ReaderMode, ReaderOptions, ScanOptions, SstBlockSize,
+    TracingOptions, Ttl, WriteOptions,
 };
 pub use db::Db;
 pub use db_reader::DbReader;
@@ -41,15 +46,17 @@ pub use metrics::{
     MetricValue, MetricsRecorder, UpDownCounter,
 };
 pub use object_store::ObjectStore;
+pub use object_store_builder::{ObjectStoreBuilder, ObjectStoreType};
 pub use settings::Settings;
 pub use types::{
     CacheTarget, Checkpoint, CloneSourceSpec, Compaction, CompactionSpec, CompactionStatus,
     CompactorStateView, CompressionCodec, DbStatus, ExternalDb, FilterFormat,
-    IdentifiedObjectMetadata, KeyRange, KeyValue, ObjectMetadata, RowEntry, RowEntryKind,
+    IdentifiedObjectMetadata, KeyRange, KeyValue, ObjectMetadata, RowEntry, RowEntryKind, Segment,
     SegmentPrefix, SortedRun, SourceId, SsTableHandle, SsTableId, SsTableInfo, SsTableView,
-    SstType, VersionedCompactions, VersionedManifest, WriteHandle,
+    SstType, VersionedCompactions, VersionedManifest,
 };
-pub use wal_reader::{WalFile, WalFileIterator, WalReader};
+pub use wal_reader::{SlateDbWalIterator, SlateDbWalReader, SlateDbWalReaderOptions, WalRows};
 pub use write_batch::WriteBatch;
+pub use write_handle::WriteHandle;
 
 uniffi::setup_scaffolding!("slatedb");

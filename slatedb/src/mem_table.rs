@@ -18,6 +18,7 @@ use crate::db_common::extract_segment_prefix;
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::prefix_extractor::PrefixExtractor;
+use crate::reader::ReadTrace;
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
 use crate::types::RowEntry;
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
@@ -162,15 +163,15 @@ impl WritableKVTable {
 }
 
 pub(crate) struct ImmutableMemtable {
-    /// The recent flushed WAL ID when this IMM is freezed. This is used to determine the starting
-    /// position of WAL replay during recovery. After an IMM is flushed to L0, we do not need to
-    /// care about the earlier WALs which produced this IMM, all we need to know is the recent
-    /// WAL ID of the last L0 compacted.
+    /// A WAL ID for which it is guaranteed that all writes in the contained WAL object are present
+    /// in this memtable. This is used to determine a safe replay point when this IMM is flushed to
+    /// a new L0. On a restart, only WALs after this id may contain data that is not present in the
+    /// tree.
     ///
-    /// Please note that this recent flushed WAL ID might not exactly match the last WAL ID that
-    /// produced this IMM, we still need to take the last l0's `last_seq` to filter out the entries
-    /// that already contained in the last L0 SST.
-    recent_flushed_wal_id: u64,
+    /// Please note that this WAL ID might not exactly match the last WAL ID that produced this
+    /// IMM, so we still need to take the last l0's `last_seq` to filter out the entries that are
+    /// already contained in the last L0 SST.
+    replay_after_wal_id: u64,
     table: Arc<KVTable>,
     /// Notified when the memtable's SST has been uploaded to object storage.
     /// Used to release backpressure on writers when unflushed bytes are too high.
@@ -194,6 +195,7 @@ pub(crate) struct MemTableIteratorInner<T: RangeBounds<SequencedKey>> {
     /// in seq-ascending order. Pushing them onto this stack and popping gives
     /// seq-descending order, which is what the merge iterator needs for dedup.
     descending_stack: Vec<RowEntry>,
+    read_trace: ReadTrace,
 }
 pub(crate) type MemTableIterator = MemTableIteratorInner<KVTableInternalKeyRange>;
 
@@ -212,6 +214,8 @@ impl RowEntryIterator for MemTableIterator {
             let front = self.borrow_item().clone();
             if front.is_some_and(|record| record.key < next_key) {
                 self.next_sync();
+                // Keep in-memory seeking cooperative.
+                tokio::task::coop::consume_budget().await;
             } else {
                 return Ok(());
             }
@@ -221,6 +225,8 @@ impl RowEntryIterator for MemTableIterator {
 
 impl MemTableIterator {
     pub(crate) fn next_sync(&mut self) -> Option<RowEntry> {
+        let span = self.borrow_read_trace().new_memtable_span();
+        let _guard = span.enter();
         match self.borrow_ordering() {
             IterationOrder::Ascending => self.next_ascending(),
             IterationOrder::Descending => self.next_descending(),
@@ -289,11 +295,11 @@ impl MemTableIterator {
 }
 
 impl ImmutableMemtable {
-    pub(crate) fn new(table: WritableKVTable, recent_flushed_wal_id: u64) -> Self {
+    pub(crate) fn new(table: WritableKVTable, replay_after_wal_id: u64) -> Self {
         let sequence_tracker = table.table.sequence_tracker_snapshot();
         Self {
             table: table.table,
-            recent_flushed_wal_id,
+            replay_after_wal_id,
             uploaded: WatchableOnceCell::new(),
             sequence_tracker,
         }
@@ -310,7 +316,7 @@ impl ImmutableMemtable {
     }
 
     pub(crate) fn recent_flushed_wal_id(&self) -> u64 {
-        self.recent_flushed_wal_id
+        self.replay_after_wal_id
     }
 
     pub(crate) async fn await_uploaded(&self) -> Result<(), SlateDBError> {
@@ -355,7 +361,7 @@ impl ImmutableMemtable {
             }
         }
         new_table.record_touched_segments(surviving_segments);
-        Ok(Self::new(new_table, self.recent_flushed_wal_id))
+        Ok(Self::new(new_table, self.replay_after_wal_id))
     }
 }
 
@@ -498,13 +504,14 @@ impl KVTable {
     }
 
     pub(crate) fn range_ascending<T: RangeBounds<Bytes>>(&self, range: T) -> MemTableIterator {
-        self.range(range, IterationOrder::Ascending)
+        self.range(range, IterationOrder::Ascending, ReadTrace::new(None))
     }
 
     pub(crate) fn range<T: RangeBounds<Bytes>>(
         &self,
         range: T,
         ordering: IterationOrder,
+        read_trace: ReadTrace,
     ) -> MemTableIterator {
         let internal_range = KVTableInternalKeyRange::from(range);
         let mut iterator = MemTableIteratorInnerBuilder {
@@ -513,6 +520,7 @@ impl KVTable {
             ordering,
             item: None,
             descending_stack: Vec::new(),
+            read_trace,
         }
         .build();
         iterator.next_sync();
@@ -527,13 +535,12 @@ impl KVTable {
         // because the monotonicity is enforced when generating the clock tick
         // (see [crate::utils::MonotonicClock::now])
         if let Some(create_ts) = row.create_ts {
-            self.last_tick
-                .fetch_max(create_ts, atomic::Ordering::SeqCst);
+            self.last_tick.fetch_max(create_ts, SeqCst);
         }
         // update the last seq number if it is greater than the current last seq
-        self.last_seq.fetch_max(row.seq, atomic::Ordering::SeqCst);
+        self.last_seq.fetch_max(row.seq, SeqCst);
         // update the first seq number if it is smaller than the current first seq
-        self.first_seq.fetch_min(row.seq, atomic::Ordering::SeqCst);
+        self.first_seq.fetch_min(row.seq, SeqCst);
 
         let row_size = row.estimated_size();
         self.map.compare_insert(internal_key, row, |previous_row| {
@@ -859,7 +866,10 @@ mod tests {
             .run(
                 &(arbitrary::nonempty_range(10), arbitrary::iteration_order()),
                 |(range, ordering)| {
-                    let mut kv_iter = kv_table.table.range(range.clone(), ordering);
+                    let mut kv_iter =
+                        kv_table
+                            .table
+                            .range(range.clone(), ordering, ReadTrace::new(None));
 
                     runtime.block_on(test_utils::assert_ranged_kv_scan(
                         &sample_table,
@@ -1075,7 +1085,9 @@ mod tests {
         table.put(RowEntry::new_value(b"bbbb", b"new", 2));
         table.put(RowEntry::new_value(b"cccc", b"v3", 3));
 
-        let mut iter = table.table().range(.., IterationOrder::Descending);
+        let mut iter = table
+            .table()
+            .range(.., IterationOrder::Descending, ReadTrace::new(None));
 
         // In descending order, for key "bbbb" the newest version (seq 2) must
         // come before the older version (seq 1) so that dedup works correctly.

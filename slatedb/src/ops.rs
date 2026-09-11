@@ -1,14 +1,13 @@
 use bytes::Bytes;
-use std::ops::RangeBounds;
 use uuid::Uuid;
 
 use crate::batch::WriteBatch;
-use crate::bytes_range::BytesRange;
+use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::config::{
     FlushOptions, MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions,
 };
 use crate::db::WriteHandle;
-use crate::db_cache_manager::CacheTarget;
+use crate::db_cache::CacheTarget;
 use crate::db_state::SsTableId;
 use crate::db_status::DbStatus;
 use crate::manifest::VersionedManifest;
@@ -186,10 +185,9 @@ pub trait DbReadOps {
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
-    async fn scan<K, T>(&self, range: T) -> Result<DbIterator, crate::Error>
+    async fn scan<T>(&self, range: T) -> Result<DbIterator, crate::Error>
     where
-        K: AsRef<[u8]> + Send,
-        T: RangeBounds<K> + Send,
+        T: ByteRangeBounds + Send,
     {
         self.scan_with_options(range, &ScanOptions::default()).await
     }
@@ -207,14 +205,13 @@ pub trait DbReadOps {
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
-    async fn scan_with_options<K, T>(
+    async fn scan_with_options<T>(
         &self,
         range: T,
         options: &ScanOptions,
     ) -> Result<DbIterator, crate::Error>
     where
-        K: AsRef<[u8]> + Send,
-        T: RangeBounds<K> + Send;
+        T: ByteRangeBounds + Send;
 
     /// Scan keys that share the provided prefix, restricted to `subrange`,
     /// using the default scan options.
@@ -230,14 +227,10 @@ pub trait DbReadOps {
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
-    async fn scan_prefix<'a, P, T>(
-        &self,
-        prefix: P,
-        subrange: T,
-    ) -> Result<DbIterator, crate::Error>
+    async fn scan_prefix<P, T>(&self, prefix: P, subrange: T) -> Result<DbIterator, crate::Error>
     where
         P: AsRef<[u8]> + Send,
-        T: RangeBounds<&'a [u8]> + Send,
+        T: ByteRangeBounds + Send,
     {
         self.scan_prefix_with_options(prefix, subrange, &ScanOptions::default())
             .await
@@ -255,7 +248,7 @@ pub trait DbReadOps {
     ///
     /// ## Returns
     /// - `Result<DbIterator, Error>`: An iterator with the results of the scan
-    async fn scan_prefix_with_options<'a, P, T>(
+    async fn scan_prefix_with_options<P, T>(
         &self,
         prefix: P,
         subrange: T,
@@ -263,7 +256,7 @@ pub trait DbReadOps {
     ) -> Result<DbIterator, crate::Error>
     where
         P: AsRef<[u8]> + Send,
-        T: RangeBounds<&'a [u8]> + Send,
+        T: ByteRangeBounds + Send,
     {
         let range = BytesRange::from_prefix_and_subrange(prefix.as_ref(), subrange);
         self.scan_with_options(range, options).await
@@ -275,6 +268,11 @@ pub trait DbReadOps {
 /// This trait defines the asynchronous write API exposed by [`Db`](crate::Db),
 /// allowing consumers to write generic code or test doubles over the writer
 /// surface without depending on the concrete `Db` type.
+///
+/// Write methods return after updating the in-memory WAL and MemTable. They do
+/// not wait for the write to become durable in object storage. Call
+/// [`WriteHandle::await_durable`] on the returned handle to wait for one write,
+/// or [`Self::flush`] to flush all pending writes.
 #[async_trait::async_trait]
 pub trait DbWriteOps {
     /// The transaction type returned by [`Self::begin`]. Stub
@@ -284,6 +282,9 @@ pub trait DbWriteOps {
 
     /// Write a value into the database with default `PutOptions` and
     /// `WriteOptions`.
+    ///
+    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// details.
     ///
     /// ## Arguments
     /// - `key`: the key to write
@@ -302,6 +303,9 @@ pub trait DbWriteOps {
 
     /// Write a value into the database with custom `PutOptions` and
     /// `WriteOptions`.
+    ///
+    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// details.
     ///
     /// ## Arguments
     /// - `key`: the key to write
@@ -324,6 +328,9 @@ pub trait DbWriteOps {
 
     /// Delete a key from the database with default `WriteOptions`.
     ///
+    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// details.
+    ///
     /// ## Arguments
     /// - `key`: the key to delete
     ///
@@ -335,6 +342,9 @@ pub trait DbWriteOps {
     }
 
     /// Delete a key from the database with custom `WriteOptions`.
+    ///
+    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// details.
     ///
     /// ## Arguments
     /// - `key`: the key to delete
@@ -350,6 +360,9 @@ pub trait DbWriteOps {
 
     /// Merge a value into the database with default `MergeOptions` and
     /// `WriteOptions`.
+    ///
+    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// details.
     ///
     /// Merge operations allow applications to bypass the traditional
     /// read/modify/write cycle by expressing partial updates using an
@@ -380,6 +393,9 @@ pub trait DbWriteOps {
     /// Merge a value into the database with custom `MergeOptions` and
     /// `WriteOptions`.
     ///
+    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// details.
+    ///
     /// ## Arguments
     /// - `key`: the key to merge into
     /// - `value`: the merge operand to apply
@@ -402,6 +418,9 @@ pub trait DbWriteOps {
 
     /// Write a batch of put/delete operations atomically to the database.
     ///
+    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// details.
+    ///
     /// ## Arguments
     /// - `batch`: the batch of operations to write
     ///
@@ -415,6 +434,9 @@ pub trait DbWriteOps {
     /// Write a batch of put/delete operations atomically to the database with
     /// custom `WriteOptions`.
     ///
+    /// This method does not wait for durability. See [`DbWriteOps`] for
+    /// details.
+    ///
     /// ## Arguments
     /// - `batch`: the batch of operations to write
     /// - `options`: the write options to use
@@ -427,8 +449,8 @@ pub trait DbWriteOps {
         options: &WriteOptions,
     ) -> Result<WriteHandle, crate::Error>;
 
-    /// Flush in-memory writes to disk. This function blocks until the
-    /// in-memory data has been durably written to object storage.
+    /// Flush in-memory writes to object storage. This function blocks until
+    /// the in-memory data has been durably written.
     ///
     /// ## Errors
     /// - `Error`: if there was an error flushing the database.
@@ -549,6 +571,10 @@ pub trait DbTransactionOps: DbReadOps {
 
     /// Commit the transaction with default `WriteOptions`.
     ///
+    /// A successful commit applies the write atomically but does not wait for
+    /// durability. Call [`WriteHandle::await_durable`] on the returned handle
+    /// when the result is `Some`.
+    ///
     /// ## Returns
     /// - `Ok(Some(WriteHandle))` if the commit is successful and there are
     ///   writes in the batch.
@@ -565,6 +591,11 @@ pub trait DbTransactionOps: DbReadOps {
     }
 
     /// Commit the transaction with custom `WriteOptions`.
+    ///
+    /// A successful commit applies the write atomically but does not wait for
+    /// durability. Call [`WriteHandle::await_durable`] on the returned handle
+    /// when the result is `Some`.
+    ///
     async fn commit_with_options(
         self,
         options: &WriteOptions,
@@ -666,6 +697,9 @@ pub trait DbCacheManagerOps {
     /// `FuturesUnordered`) to get the concurrency they want. Per-target
     /// outcomes are reflected in cache-manager metrics, not the return value.
     ///
+    /// Warming [`CacheTarget::Data`] also warms the SST index, since block
+    /// planning depends on it.
+    ///
     /// Returns `Err` on the first failing target. If no block cache is
     /// configured, or if the SST is not reachable from the current manifest,
     /// the call is a no-op that returns `Ok(())`.
@@ -681,6 +715,21 @@ pub trait DbCacheManagerOps {
     /// Does not check whether the SST is still live in the current manifest —
     /// callers own that policy.
     async fn evict_cached_sst(&self, sst_id: SsTableId) -> Result<(), crate::Error>;
+
+    /// Send this instance's cached data to disk.
+    ///
+    /// This moves data for this instance's `db_cache_id` from memory to disk.
+    /// It frees memory now, and protects the data from an ungraceful
+    /// process exit later. A later instance with the same `db_cache_id` can
+    /// read the data back from disk.
+    ///
+    /// This affects the whole scope, not only this instance's own reads
+    /// and writes. If another instance uses the same `db_cache_id`, this call
+    /// also flushes that instance's data.
+    ///
+    /// Does nothing if no block cache is set, or if the cache has no disk
+    /// storage.
+    async fn flush_cache_to_disk(&self) -> Result<(), crate::Error>;
 }
 
 #[cfg(test)]

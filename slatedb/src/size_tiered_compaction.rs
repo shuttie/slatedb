@@ -185,6 +185,14 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
             .flat_map(|c| c.core().recent_compactions())
             .filter(|c| c.active())
             .collect::<Vec<_>>();
+        // A Compacted job has finished using a worker slot, even though it
+        // remains active until its output is committed to the manifest. Keep
+        // it in `active_compactions` for conflict checks and destination-id
+        // reservation, but do not count it against execution capacity.
+        let compaction_slots_in_use = active_compactions
+            .iter()
+            .filter(|c| c.status().counts_against_max_concurrent())
+            .count();
         let mut next_fresh_sr_id = next_global_sr_id(db_state, &active_compactions);
 
         // Precompute per-tree (sources, conflict checker, backpressure) once
@@ -235,7 +243,7 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
         loop {
             let mut picked_any = false;
             for tree in &mut trees {
-                if active_compactions.len() + compactions.len() >= self.max_concurrent_compactions {
+                if compaction_slots_in_use + compactions.len() >= self.max_concurrent_compactions {
                     break;
                 }
                 if let Some(compaction) = self.pick_next_compaction(tree, &mut next_fresh_sr_id) {
@@ -256,7 +264,7 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
         &self,
         state: &CompactorStateView,
         compaction: &CompactionSpec,
-    ) -> Result<(), crate::error::Error> {
+    ) -> Result<(), Error> {
         // Size-tiered does not propose drain specs and has no policy
         // opinions on them. Drain invariants belong to the compactor-level
         // validation.
@@ -435,7 +443,7 @@ fn compaction_sources(tree: &LsmTreeState) -> (Vec<CompactionSource>, Vec<Compac
         .iter()
         .map(|view| CompactionSource {
             source: SourceId::SstView(view.id),
-            size: view.estimate_size(),
+            size: view.estimate_visible_size(),
         })
         .collect();
     let srs: Vec<CompactionSource> = tree
@@ -443,7 +451,7 @@ fn compaction_sources(tree: &LsmTreeState) -> (Vec<CompactionSource>, Vec<Compac
         .iter()
         .map(|sr| CompactionSource {
             source: SourceId::SortedRun(sr.id),
-            size: sr.estimate_size(),
+            size: sr.estimate_visible_size(),
         })
         .collect();
     (l0, srs)
@@ -500,8 +508,9 @@ mod tests {
 
     use crate::compactor::{CompactionScheduler, CompactionSchedulerSupplier};
 
+    use crate::bytes_range::BytesRange;
     use crate::compactor_state::{
-        Compaction, CompactionSpec, Compactions, CompactorState, SourceId,
+        Compaction, CompactionSpec, CompactionStatus, Compactions, CompactorState, SourceId,
     };
     use crate::config::{CompactorOptions, SizeTieredCompactionSchedulerOptions};
     use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
@@ -509,6 +518,7 @@ mod tests {
     use crate::manifest::store::test_utils::new_dirty_manifest;
     use crate::manifest::{LsmTreeState, ManifestCore, Segment};
     use crate::seq_tracker::SequenceTracker;
+    use crate::size_tiered_compaction::CompactionSource;
     use crate::size_tiered_compaction::{
         SizeTieredCompactionScheduler, SizeTieredCompactionSchedulerSupplier,
     };
@@ -517,6 +527,7 @@ mod tests {
     use slatedb_common::clock::DefaultSystemClock;
     use slatedb_common::DbRand;
     use slatedb_txn_obj::test_utils::new_dirty_object;
+    use std::ops::Bound::{Excluded, Included};
     use std::sync::Arc;
 
     #[test]
@@ -692,6 +703,37 @@ mod tests {
 
         // then:
         assert_eq!(requests.len(), 0);
+    }
+
+    #[test]
+    fn test_compacted_job_does_not_consume_compaction_slot() {
+        // A finished worker job in one tree is still waiting for its manifest
+        // commit, while a disjoint tree has eligible work. With one worker
+        // slot, the scheduler should immediately refill that slot.
+        let scheduler =
+            SizeTieredCompactionScheduler::new(SizeTieredCompactionSchedulerOptions::default(), 1);
+        let root_l0: Vec<SsTableView> = (0..4).map(|_| create_sst_view(1)).collect();
+        let segment_l0: Vec<SsTableView> = (0..4).map(|_| create_sst_view(1)).collect();
+        let mut core = create_db_state(root_l0.iter().cloned().collect(), Vec::new());
+        core.segments = vec![segment_with(
+            b"finished/",
+            segment_l0.iter().cloned().collect(),
+            Vec::new(),
+        )];
+        let mut state = create_compactor_state(core);
+
+        let completed_worker_job = Compaction::new(
+            ulid::Ulid::new(),
+            create_segment_l0_compaction(b"finished/", &segment_l0, 0),
+        )
+        .with_status(CompactionStatus::Compacted);
+        state.insert_compaction_for_test(completed_worker_job);
+
+        let requests = scheduler.propose(&(&state).into());
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].segment().is_empty());
+        assert_eq!(requests[0].destination(), Some(1));
     }
 
     #[test]
@@ -956,7 +998,7 @@ mod tests {
             ..Default::default()
         };
         SsTableView::identity(SsTableHandle::new(
-            SsTableId::Compacted(ulid::Ulid::new()),
+            SsTableId::from(ulid::Ulid::new()),
             SST_FORMAT_VERSION_LATEST,
             info,
         ))
@@ -972,10 +1014,111 @@ mod tests {
 
     fn create_sr(id: u32, sst_size: u64, num_ssts: usize) -> SortedRun {
         let ssts: Vec<SsTableView> = (0..num_ssts).map(|_| create_sst_view(sst_size)).collect();
-        SortedRun {
-            id,
-            sst_views: ssts,
-        }
+        SortedRun::new(id, ssts)
+    }
+
+    fn create_sst_view_with_bounds(first: &[u8], last: &[u8], size: u64) -> SsTableView {
+        let info = SsTableInfo {
+            first_entry: Some(Bytes::copy_from_slice(first)),
+            last_entry: Some(Bytes::copy_from_slice(last)),
+            index_offset: size,
+            index_len: 0,
+            filter_offset: 0,
+            filter_len: 0,
+            compression_codec: None,
+            ..Default::default()
+        };
+        SsTableView::identity(SsTableHandle::new(
+            SsTableId::new(ulid::Ulid::new()),
+            SST_FORMAT_VERSION_LATEST,
+            info,
+        ))
+    }
+
+    #[test]
+    fn test_borrowed_sst_views_join_compactable_run() {
+        let parent = create_sst_view_with_bounds(b"a", b"z", 4_000_000);
+        let borrowed_first_half = parent.with_visible_range(BytesRange::new(
+            Included(Bytes::copy_from_slice(b"a")),
+            Excluded(Bytes::copy_from_slice(b"m")),
+        ));
+        let borrowed_second_half = parent.with_visible_range(BytesRange::new(
+            Included(Bytes::copy_from_slice(b"m")),
+            Included(Bytes::copy_from_slice(b"z")),
+        ));
+        let peer = create_sst_view_with_bounds(b"aa", b"az", 600_000);
+
+        let sources = vec![
+            CompactionSource {
+                source: SourceId::SstView(peer.id),
+                size: peer.estimate_visible_size(),
+            },
+            CompactionSource {
+                source: SourceId::SstView(borrowed_first_half.id),
+                size: borrowed_first_half.estimate_visible_size(),
+            },
+            CompactionSource {
+                source: SourceId::SstView(borrowed_second_half.id),
+                size: borrowed_second_half.estimate_visible_size(),
+            },
+        ];
+
+        let run = SizeTieredCompactionScheduler::build_compactable_run(4.0, &sources, 0, None);
+
+        assert_eq!(
+            run.len(),
+            3,
+            "borrowed halves should scale down enough to join the peer's \
+             compactable run within the 4.0x size threshold, got sizes {:?}",
+            sources.iter().map(|s| s.size).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_propose_compacts_sorted_run_mixing_borrowed_and_plain_views() {
+        let scheduler = SizeTieredCompactionScheduler::default();
+
+        let plain_view = create_sst_view_with_bounds(b"a", b"z", 50_000);
+
+        let prefix = b"tenant00";
+        let phys_low = [prefix.as_slice(), &[0]].concat();
+        let phys_high = [prefix.as_slice(), &[200]].concat();
+        let vis_low = [prefix.as_slice(), &[0]].concat();
+        let vis_high = [prefix.as_slice(), &[10]].concat();
+        let borrowed_view = create_sst_view_with_bounds(&phys_low, &phys_high, 1_000_000)
+            .with_visible_range(BytesRange::new(
+                Included(Bytes::copy_from_slice(&vis_low)),
+                Excluded(Bytes::copy_from_slice(&vis_high)),
+            ));
+
+        let mixed_sr = SortedRun::new(0, [plain_view, borrowed_view]);
+        let mixed_sr_size = mixed_sr.estimate_visible_size();
+        assert!(
+            (80_000..120_000).contains(&mixed_sr_size),
+            "expected the mixed sorted run's aggregate to land near \
+             plain (50KB) + borrowed-visible (~50KB) = ~100KB, got {mixed_sr_size}"
+        );
+
+        let state = &create_compactor_state(create_db_state(
+            VecDeque::new(),
+            vec![
+                mixed_sr,
+                create_sr(1, 100_000, 1),
+                create_sr(2, 100_000, 1),
+                create_sr(3, 100_000, 1),
+            ],
+        ));
+
+        let compactions = scheduler.propose(&state.into());
+
+        assert_eq!(
+            compactions.len(),
+            1,
+            "the mixed sorted run's sane aggregate should let it join a compactable run with its peers"
+        );
+        let compaction = compactions.first().unwrap();
+        let expected_compaction = create_sr_compaction(vec![0, 1, 2, 3]);
+        assert_eq!(compaction.clone(), expected_compaction);
     }
 
     fn create_db_state(l0: VecDeque<SsTableView>, srs: Vec<SortedRun>) -> ManifestCore {

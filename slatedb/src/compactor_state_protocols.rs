@@ -110,6 +110,8 @@ pub(crate) struct CompactorStateWriter {
     manifest: FenceableManifest,
     /// Fenceable compactions handle used for refresh/update with fencing.
     compactions: FenceableCompactions,
+    /// Lifetime of checkpoints that protect compaction inputs during manifest updates.
+    checkpoint_lifetime: Duration,
     /// RNG for checkpoint ids.
     rand: Arc<DbRand>,
 }
@@ -170,6 +172,7 @@ impl CompactorStateWriter {
             state,
             manifest,
             compactions,
+            checkpoint_lifetime: options.checkpoint_lifetime,
             rand,
         })
     }
@@ -240,10 +243,9 @@ impl CompactorStateWriter {
 
     /// Persists the updated manifest after a compaction finishes.
     ///
-    /// A checkpoint with a 15-minute lifetime is written first to prevent GC from
-    /// deleting SSTs that are about to be removed. This is to keep them around for a
-    /// while in case any in-flight operations (such as iterator scans) are still using
-    /// them.
+    /// A checkpoint is written first to prevent GC from deleting SSTs that are about
+    /// to be removed. Its configured lifetime keeps them available to in-flight
+    /// operations such as iterator scans.
     async fn write_manifest(&mut self) -> Result<(), SlateDBError> {
         // write the checkpoint first so that it points to the manifest with the ssts
         // being removed
@@ -252,13 +254,7 @@ impl CompactorStateWriter {
             .write_checkpoint(
                 checkpoint_id,
                 &CheckpointOptions {
-                    // TODO(rohan): for now, just write a checkpoint with 15-minute expiry
-                    //              so that it's extremely unlikely for the gc to delete ssts
-                    //              out from underneath the writer. In a follow up, we'll write
-                    //              a checkpoint with no expiry and with metadata indicating its
-                    //              a compactor checkpoint. Then, the gc will delete the checkpoint
-                    //              based on a configurable timeout
-                    lifetime: Some(Duration::from_secs(900)),
+                    lifetime: Some(self.checkpoint_lifetime),
                     ..CheckpointOptions::default()
                 },
             )
@@ -290,6 +286,11 @@ impl CompactorStateWriter {
     /// Persists the current compactions state to the compactions store and refreshes the
     /// local dirty object with the latest version.
     ///
+    /// Process-local state retains every terminal transition until this write succeeds.
+    /// Only the outgoing value is trimmed to the latest terminal entry. This preserves
+    /// terminal entries as tombstones across conflict retries while keeping the persisted
+    /// `.compactions` object bounded.
+    ///
     /// ## Returns
     /// - `Ok(())` when compactions are successfully written.
     /// - `SlateDBError` if an unrecoverable error occurs.
@@ -307,8 +308,10 @@ impl CompactorStateWriter {
                 }
                 Err(err) if err.is_sequenced_write_conflict() => {
                     // Merge the latest remote state (e.g. a worker's Compacted write) into
-                    // the coordinator's view before retrying. Without this, retrying with a stale
-                    // desired_value could silently overwrite worker progress.
+                    // the coordinator's untrimmed local view before retrying. Without this,
+                    // retrying with a stale desired_value could silently overwrite worker
+                    // progress. Local terminal entries also prevent stale remote active states
+                    // for the same ids from being resurrected.
                     self.load_compactions().await?;
                     desired_value = self.state.compactions().value.clone();
                     desired_value.retain_active_and_last_finished();
@@ -334,16 +337,19 @@ impl CompactorStateWriter {
 mod tests {
     use super::*;
     use crate::admin::AdminBuilder;
+    use crate::bytes_range::BytesRange;
     use crate::compactions_store::{CompactionsStore, StoredCompactions};
     use crate::compactor_state::{
-        Compaction, CompactionSpec, CompactionStatus, Compactions, CompactorState,
-        VersionedCompactions, WorkerSpec,
+        Compaction, CompactionContext, CompactionSpec, CompactionStatus, Compactions,
+        CompactorState, VersionedCompactions, WorkerSpec,
     };
     use crate::db_state::{SsTableHandle, SsTableId, SsTableInfo};
     use crate::error::SlateDBError;
     use crate::format::sst::SST_FORMAT_VERSION_LATEST;
     use crate::manifest::store::{ManifestStore, StoredManifest};
-    use crate::manifest::{Manifest, ManifestCore, VersionedManifest};
+    use crate::manifest::{ExternalDb, Manifest, ManifestCore, VersionedManifest};
+    use crate::subcompaction::Subcompaction;
+    use crate::test_utils::GatedObjectStore;
     use bytes::Bytes;
     use object_store::memory::InMemory;
     use object_store::path::Path;
@@ -613,7 +619,7 @@ mod tests {
 
         let output_ssts = vec![
             SsTableHandle::new(
-                SsTableId::Compacted(Ulid::from_parts(10, 0)),
+                SsTableId::from(Ulid::from_parts(10, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 SsTableInfo {
                     first_entry: Some(Bytes::copy_from_slice(b"a")),
@@ -621,7 +627,7 @@ mod tests {
                 },
             ),
             SsTableHandle::new(
-                SsTableId::Compacted(Ulid::from_parts(11, 0)),
+                SsTableId::from(Ulid::from_parts(11, 0)),
                 SST_FORMAT_VERSION_LATEST,
                 SsTableInfo {
                     first_entry: Some(Bytes::copy_from_slice(b"m")),
@@ -629,6 +635,10 @@ mod tests {
                 },
             ),
         ];
+        let job_ctx = Some(CompactionContext::new(
+            vec![Subcompaction::new(BytesRange::unbounded()).with_output_ssts(output_ssts.clone())],
+            Some(0),
+        ));
 
         let mut stored_compactions = StoredCompactions::create(compactions_store.clone(), 0)
             .await
@@ -638,7 +648,7 @@ mod tests {
         dirty.value.insert(
             Compaction::new(running_id, CompactionSpec::new(vec![], 0))
                 .with_status(CompactionStatus::Running)
-                .with_output_ssts(output_ssts.clone()),
+                .with_ctx(job_ctx.clone()),
         );
         stored_compactions.update(dirty).await.unwrap();
 
@@ -661,10 +671,10 @@ mod tests {
             .value
             .get(&running_id)
             .expect("missing running compaction");
-        // new() leaves Running entries untouched and preserves their output_ssts
+        // new() leaves Running entries untouched and preserves their output
         // through the load; reclaiming stale ones is the ticker's job.
         assert_eq!(compaction.status(), CompactionStatus::Running);
-        assert_eq!(compaction.output_ssts(), &output_ssts);
+        assert_eq!(compaction.ctx(), job_ctx.as_ref());
     }
 
     /// `CompactorStateWriter::new` no longer reclaims stale `Running`
@@ -884,6 +894,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_compactions_safely_does_not_resurrect_terminal_on_conflict() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest_store = Arc::new(ManifestStore::new(
+            &Path::from(ROOT),
+            Arc::clone(&object_store),
+        ));
+        let compactions_store = Arc::new(CompactionsStore::new(
+            &Path::from(ROOT),
+            Arc::clone(&object_store),
+        ));
+        let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+
+        StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            system_clock.clone(),
+        )
+        .await
+        .unwrap();
+
+        let mut writer = CompactorStateWriter::new(
+            manifest_store,
+            compactions_store.clone(),
+            system_clock,
+            &CompactorOptions::default(),
+            Arc::new(DbRand::new(7)),
+        )
+        .await
+        .unwrap();
+
+        let completed_id = Ulid::from_parts(10, 0);
+        let failed_id = Ulid::from_parts(20, 0);
+        let spec = CompactionSpec::new(vec![], 0);
+        writer
+            .state
+            .insert_compaction_for_test(Compaction::new(completed_id, spec.clone()));
+        writer
+            .state
+            .insert_compaction_for_test(Compaction::new(failed_id, spec.clone()));
+        writer.state.update_compaction(&completed_id, |compaction| {
+            compaction.set_status(CompactionStatus::Completed)
+        });
+        writer.state.update_compaction(&failed_id, |compaction| {
+            compaction.set_status(CompactionStatus::Failed)
+        });
+
+        // Advance the remote version with the pre-transition state of the completed
+        // compaction. This forces the coordinator's first write to conflict and reload.
+        let mut external = StoredCompactions::load(compactions_store.clone())
+            .await
+            .unwrap();
+        let mut dirty = external.prepare_dirty().unwrap();
+        dirty.value.insert(Compaction::new(completed_id, spec));
+        external.update(dirty).await.unwrap();
+
+        writer.write_compactions_safely().await.unwrap();
+
+        let persisted = compactions_store.read_latest_compactions().await.unwrap();
+        assert!(
+            persisted
+                .recent_compactions()
+                .all(|compaction| compaction.id() != completed_id),
+            "stale Submitted compaction was resurrected"
+        );
+        assert_eq!(
+            persisted
+                .recent_compactions()
+                .find(|compaction| compaction.id() == failed_id)
+                .expect("latest terminal compaction was not retained")
+                .status(),
+            CompactionStatus::Failed
+        );
+        assert_eq!(writer.state.active_compactions().count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_write_compactions_safely_retries_on_boundary_conflict() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let manifest_store = Arc::new(ManifestStore::new(
@@ -971,8 +1057,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_manifest_safely_retries_on_version_conflict() {
+    async fn test_write_manifest_uses_configured_checkpoint_lifetime() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest_store = Arc::new(ManifestStore::new(
+            &Path::from(ROOT),
+            Arc::clone(&object_store),
+        ));
+        let compactions_store = Arc::new(CompactionsStore::new(&Path::from(ROOT), object_store));
+        let clock = Arc::new(MockSystemClock::with_time(1_000));
+        let system_clock: Arc<dyn SystemClock> = clock.clone();
+
+        StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            system_clock.clone(),
+        )
+        .await
+        .unwrap();
+
+        let checkpoint_lifetime = Duration::from_secs(42);
+        let options = CompactorOptions {
+            checkpoint_lifetime,
+            ..CompactorOptions::default()
+        };
+        let mut writer = CompactorStateWriter::new(
+            manifest_store.clone(),
+            compactions_store,
+            system_clock.clone(),
+            &options,
+            Arc::new(DbRand::new(7)),
+        )
+        .await
+        .unwrap();
+
+        writer.write_manifest_safely().await.unwrap();
+
+        let latest = manifest_store.read_latest_manifest().await.unwrap();
+        let checkpoint = latest
+            .manifest
+            .core
+            .checkpoints
+            .last()
+            .expect("missing compactor checkpoint");
+        assert_eq!(
+            Some(system_clock.now() + checkpoint_lifetime),
+            checkpoint.expire_time
+        );
+    }
+
+    #[tokio::test]
+    async fn write_manifest_safely_retries_on_version_conflict() {
+        let inner_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated_store = Arc::new(GatedObjectStore::new(Arc::clone(&inner_store)));
+        let object_store: Arc<dyn ObjectStore> = gated_store.clone();
         let manifest_store = Arc::new(ManifestStore::new(
             &Path::from(ROOT),
             Arc::clone(&object_store),
@@ -983,13 +1120,24 @@ mod tests {
         ));
         let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
 
-        StoredManifest::create_new_db(
+        let mut stored_manifest = StoredManifest::create_new_db(
             manifest_store.clone(),
             ManifestCore::new(),
             system_clock.clone(),
         )
         .await
         .unwrap();
+        let stale_sst_id = SsTableId::from(Ulid::new());
+        let source_checkpoint_id = uuid::Uuid::new_v4();
+        let final_checkpoint_id = uuid::Uuid::new_v4();
+        let mut dirty = stored_manifest.prepare_dirty().unwrap();
+        dirty.value.external_dbs = vec![ExternalDb {
+            path: "/parent/db".to_string(),
+            source_checkpoint_id,
+            final_checkpoint_id: Some(final_checkpoint_id),
+            sst_ids: vec![stale_sst_id],
+        }];
+        stored_manifest.update(dirty).await.unwrap();
 
         let options = CompactorOptions::default();
         let rand = Arc::new(DbRand::new(7));
@@ -1007,25 +1155,51 @@ mod tests {
         // Record the version after fencing.
         let start_id = manifest_store.read_latest_manifest().await.unwrap().id;
 
-        // Simulate an external writer creating a checkpoint of the manifest and updating it.
-        let admin = AdminBuilder::new(ROOT, object_store.clone()).build();
-        admin
+        // Allow write_manifest's checkpoint through, then block its manifest update.
+        // The safe path has already loaded and pruned local state at that boundary.
+        let baseline_puts = gated_store.put_opts_gate.arrivals();
+        gated_store.put_opts_gate.close();
+        gated_store.put_opts_gate.admit(1);
+        let write_task = tokio::spawn(async move { writer.write_manifest_safely().await });
+        gated_store
+            .put_opts_gate
+            .wait_for_arrivals(baseline_puts + 2)
+            .await;
+
+        // Race a checkpoint into the exact version intended by the blocked update.
+        let admin = AdminBuilder::new(ROOT, inner_store).build();
+        let remote_checkpoint = admin
             .create_detached_checkpoint(&CheckpointOptions::default())
             .await
             .expect("create checkpoint failed");
 
         let conflicting_id = manifest_store.read_latest_manifest().await.unwrap().id;
-        assert_eq!(conflicting_id, start_id + 1);
+        assert_eq!(conflicting_id, start_id + 2);
 
-        // This should retry on conflict and succeed with a new version.
-        writer.write_manifest_safely().await.unwrap();
+        // Reloading and retrying must neither resurrect the pruned SST nor lose
+        // checkpoint metadata from either the external DB or the racing writer.
+        gated_store.put_opts_gate.release();
+        write_task.await.unwrap().unwrap();
 
-        let final_id = manifest_store.read_latest_manifest().await.unwrap().id;
+        let final_manifest = manifest_store.read_latest_manifest().await.unwrap();
+        let external = &final_manifest.manifest.external_dbs[0];
+        assert!(external.sst_ids.is_empty());
+        assert_eq!(external.source_checkpoint_id, source_checkpoint_id);
+        assert_eq!(external.final_checkpoint_id, Some(final_checkpoint_id));
+        assert!(final_manifest
+            .manifest
+            .core
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.id == remote_checkpoint.id));
+
+        let final_id = final_manifest.id;
         // write_manifest_safely now bumps the manifest twice per successful call because write_manifest
         // writes a checkpoint first:
         // - write_manifest() calls self.manifest.write_checkpoint(...) to create the checkpoint, then
         // - write_manifest() calls self.manifest.update(...) to update the manifest
-        // So we do +1 for the external update and +2 for the successful write_manifest_safely call.
-        assert_eq!(final_id, start_id + 3);
+        // So we do +1 for the first checkpoint, +1 for the external update, and +2 for
+        // the successful retry.
+        assert_eq!(final_id, start_id + 4);
     }
 }

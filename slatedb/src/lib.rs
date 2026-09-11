@@ -33,6 +33,8 @@ pub use fail_parallel;
 pub use object_store;
 
 pub use batch::WriteBatch;
+pub use block_cache_policy::BlockCachePolicy;
+pub use bytes_range::ByteRangeBounds;
 pub use cached_object_store::stats as cached_object_store_stats;
 pub use checkpoint::{Checkpoint, CheckpointCreateResult};
 #[cfg(feature = "compaction_filters")]
@@ -47,33 +49,36 @@ pub use config::{Settings, SstBlockSize};
 pub use db::builder::{CloneSourceSpec, CompactionWorkerBuilder};
 pub use db::{Db, DbBuilder, DbReaderBuilder, DbStatus, SegmentPrefix, WriteHandle};
 pub use db_cache::stats as db_cache_stats;
-pub use db_cache_manager::CacheTarget;
+pub use db_cache::CacheTarget;
 pub use db_iter::{DbIterator, DbRecencyIterator};
-pub use db_reader::DbReader;
+pub use db_reader::{DbReader, DbReaderMode};
 pub use db_snapshot::DbSnapshot;
 pub use db_transaction::DbTransaction;
 pub use error::{CloseReason, Error, ErrorKind};
 pub use filter::BloomFilter;
 pub use filter_policy::{
     BloomFilterPolicy, Filter, FilterBuilder, FilterContext, FilterPolicy, FilterQuery,
+    FilterTarget,
 };
 pub use format::sst::BlockTransformer;
 pub use garbage_collector::stats as garbage_collector_stats;
-pub use garbage_collector::GarbageCollectorBuilder;
+pub use garbage_collector::{GarbageCollectorBuilder, GcFilter};
 pub use instrumented_object_store::stats as instrumented_object_store_stats;
 pub use iter::IterationOrder;
 pub use manifest::VersionedManifest;
 pub use merge_operator::{MergeOperator, MergeOperatorError};
 pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbWriteOps};
+pub use paths::PathResolver;
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};
 pub use slatedb_common::{DbRand, IdentifiedObjectMetadata, ObjectMetadata};
 #[cfg(test)]
 pub use sst_builder::BlockFormat;
-pub use sst_reader::{SstFile, SstReader};
+pub use sst_reader::{SstFile, SstIndex, SstReader};
 pub use sst_stats::{BlockStats, SstStats};
 pub use transaction_manager::IsolationLevel;
 pub use types::KeyValue;
 pub use types::{RowEntry, ValueDeletable};
+pub use wal::slatedb::writer::stats as wal_buffer_stats;
 pub use wal_reader::{WalFile, WalFileIterator, WalReader};
 
 pub mod admin;
@@ -87,15 +92,18 @@ pub mod config;
 pub mod db_cache;
 pub mod db_stats;
 pub mod manifest;
+pub mod object_store_tag;
 pub mod prefix_extractor;
 pub mod seq_tracker;
 pub mod size_tiered_compaction;
+pub mod wal;
 
 mod batch;
 #[cfg(feature = "bench-internal")]
 pub use batch::benches as write_batch_benches;
 mod batch_write;
 mod blob;
+mod block_cache_policy;
 mod block_iterator;
 mod block_iterator_v2;
 #[cfg(feature = "bench-internal")]
@@ -140,7 +148,6 @@ mod memtable_flusher;
 mod merge_iterator;
 mod merge_operator;
 mod multi_sst;
-mod object_stores;
 mod ops;
 mod oracle;
 mod partitioned_keyspace;
@@ -156,10 +163,11 @@ mod single_flight;
 mod snapshot_manager;
 mod sorted_run_iterator;
 mod sst_builder;
+mod sst_io;
 mod sst_iter;
 mod sst_reader;
 mod sst_stats;
-mod store_provider;
+mod subcompaction;
 mod tablestore;
 #[cfg(test)]
 mod test_utils;
@@ -168,9 +176,6 @@ mod types;
 mod utils;
 
 mod fence;
-mod wal;
-mod wal_buffer;
-mod wal_id;
 mod wal_reader;
 mod wal_replay;
 
@@ -180,5 +185,5 @@ mod wal_replay;
 #[cfg(test)]
 #[ctor::ctor]
 fn init_test_infrastructure() {
-    crate::test_utils::init_test_infrastructure();
+    test_utils::init_test_infrastructure();
 }

@@ -25,7 +25,6 @@ fn criterion_benchmark(c: &mut Criterion) {
                 value,
                 &PutOptions::default(),
                 &WriteOptions {
-                    await_durable: false,
                     ..Default::default()
                 },
             )
@@ -69,10 +68,7 @@ fn bench_batch_reads(c: &mut Criterion, runtime: &Runtime) {
                 key.as_bytes(),
                 value.as_bytes(),
                 &PutOptions::default(),
-                &WriteOptions {
-                    await_durable: false,
-                    ..Default::default()
-                },
+                &WriteOptions::default(),
             )
             .await
             .expect("put failed");

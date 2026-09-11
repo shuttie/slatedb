@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -58,6 +59,30 @@ pub(crate) enum SlateDbError {
 
     #[error("settings update produced invalid settings: {source}")]
     InvalidSettingsUpdate { source: serde_json::Error },
+
+    #[error("object store creation failed: {source}")]
+    ObjectStoreCreationError {
+        #[from]
+        source: Box<dyn StdError>,
+    },
+
+    #[error("invalid {provider} object store config key: {key}")]
+    InvalidObjectStoreConfigKey { provider: &'static str, key: String },
+
+    #[error("missing required {provider} object store config key: {key}")]
+    MissingObjectStoreConfigKey {
+        provider: &'static str,
+        key: &'static str,
+    },
+
+    #[error("invalid object store url {url:?}: {source}")]
+    InvalidObjectStoreUrl {
+        url: String,
+        source: url::ParseError,
+    },
+
+    #[error("unsupported object store scheme in url {url:?}")]
+    UnsupportedObjectStoreScheme { url: String },
 }
 
 /// Error returned by a foreign [`crate::MergeOperator`] implementation.
@@ -147,5 +172,62 @@ impl From<slatedb::Error> for Error {
             slatedb::ErrorKind::Internal => Error::Internal { message },
             _ => Error::Internal { message },
         }
+    }
+}
+
+impl From<slatedb::wal::WalError> for Error {
+    fn from(error: slatedb::wal::WalError) -> Self {
+        let message = error.to_string();
+        match error {
+            slatedb::wal::WalError::Fenced => Error::Closed {
+                reason: CloseReason::Fenced,
+                message,
+            },
+            slatedb::wal::WalError::Closed => Error::Closed {
+                reason: CloseReason::Clean,
+                message,
+            },
+            slatedb::wal::WalError::Unavailable(_) => Error::Unavailable { message },
+            slatedb::wal::WalError::WalTruncated(_) | slatedb::wal::WalError::DataError(_) => {
+                Error::Data { message }
+            }
+            slatedb::wal::WalError::InternalError(_) => Error::Internal { message },
+            _ => Error::Internal { message },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[test]
+    fn wal_errors_preserve_binding_categories() {
+        assert!(matches!(
+            Error::from(slatedb::wal::WalError::WalTruncated(7)),
+            Error::Data { .. }
+        ));
+        assert!(matches!(
+            Error::from(slatedb::wal::WalError::Unavailable(Arc::new(
+                std::io::Error::other("offline")
+            ))),
+            Error::Unavailable { .. }
+        ));
+        assert!(matches!(
+            Error::from(slatedb::wal::WalError::Fenced),
+            Error::Closed {
+                reason: CloseReason::Fenced,
+                ..
+            }
+        ));
+        assert!(matches!(
+            Error::from(slatedb::wal::WalError::Closed),
+            Error::Closed {
+                reason: CloseReason::Clean,
+                ..
+            }
+        ));
     }
 }

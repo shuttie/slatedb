@@ -116,7 +116,10 @@ class SlateDbReaderTest {
                 }
 
                 try (DbIterator iterator =
-                        TestSupport.await(reader.scanPrefix(TestSupport.bytes("item:")))) {
+                        TestSupport.await(
+                                reader.scanPrefix(
+                                        TestSupport.bytes("item:"),
+                                        new KeyRange(null, false, null, false)))) {
                     TestSupport.assertRows(
                             TestSupport.drainIterator(iterator),
                             new String[] {"item:01", "item:02", "item:03"},
@@ -125,8 +128,24 @@ class SlateDbReaderTest {
 
                 try (DbIterator iterator =
                         TestSupport.await(
+                                reader.scanPrefix(
+                                        TestSupport.bytes("item:"),
+                                        new KeyRange(
+                                                TestSupport.bytes("02"),
+                                                false,
+                                                TestSupport.bytes("03"),
+                                                true)))) {
+                    TestSupport.assertRows(
+                            TestSupport.drainIterator(iterator),
+                            new String[] {"item:03"},
+                            new String[] {"third"});
+                }
+
+                try (DbIterator iterator =
+                        TestSupport.await(
                                 reader.scanPrefixWithOptions(
                                         TestSupport.bytes("item:"),
+                                        new KeyRange(null, false, null, false),
                                         TestSupport.scanOptions(32L, false, 1L)))) {
                     TestSupport.assertRows(
                             TestSupport.drainIterator(iterator),
@@ -247,7 +266,9 @@ class SlateDbReaderTest {
             TestSupport.await(dbHandle.db().put(TestSupport.bytes("seed"), TestSupport.bytes("value")));
             TestSupport.await(dbHandle.db().flushWithOptions(new FlushOptions(FlushType.MEM_TABLE)));
 
-            TestSupport.expectFailure(Error.Invalid.class, () -> builder.withCheckpointId("not-a-uuid"));
+            TestSupport.expectFailure(
+                    Error.Invalid.class,
+                    () -> builder.withReaderMode(new ReaderMode.Checkpoint("not-a-uuid")));
         }
     }
 
@@ -259,7 +280,7 @@ class SlateDbReaderTest {
             TestSupport.await(dbHandle.db().put(TestSupport.bytes("seed"), TestSupport.bytes("value")));
             TestSupport.await(dbHandle.db().flushWithOptions(new FlushOptions(FlushType.MEM_TABLE)));
 
-            builder.withCheckpointId("ffffffff-ffff-ffff-ffff-ffffffffffff");
+            builder.withReaderMode(new ReaderMode.Checkpoint("ffffffff-ffff-ffff-ffff-ffffffffffff"));
             TestSupport.awaitFailure(Error.Data.class, builder.build());
         }
     }

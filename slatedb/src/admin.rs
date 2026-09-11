@@ -1,5 +1,6 @@
 pub use crate::db::builder::CloneBuilder;
 pub use crate::db::builder::CloneSourceSpec;
+use std::collections::BTreeSet;
 
 use crate::checkpoint::{Checkpoint, CheckpointCreateResult};
 use crate::compactions_store::CompactionsStore;
@@ -13,13 +14,15 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::VersionedManifest;
 use slatedb_common::clock::SystemClock;
 
-use crate::object_stores::{ObjectStoreType, ObjectStores};
+use crate::retrying_object_store::RetryingObjectStore;
 use crate::seq_tracker::FindOption;
 use crate::utils::IdGenerator;
+use crate::utils::ObjectStoreType;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use object_store::path::Path;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use rand::RngCore;
 use slatedb_common::DbRand;
 use std::env;
@@ -32,6 +35,8 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 pub use crate::db::builder::AdminBuilder;
+use crate::merge_operator::MergeOperatorType;
+use crate::wal::WalAdmin;
 use slatedb_txn_obj::TransactionalObject;
 
 /// An Admin struct for SlateDB administration operations.
@@ -42,15 +47,22 @@ use slatedb_txn_obj::TransactionalObject;
 pub struct Admin {
     /// The path to the database.
     pub(crate) path: Path,
-    /// The object stores to use for the main database and WAL.
-    pub(crate) object_stores: ObjectStores,
+    /// The main object store used for manifests and compacted SSTs.
+    pub(crate) main_object_store: Arc<dyn ObjectStore>,
+    /// The object store used for the WAL. This is the main object store when no
+    /// dedicated WAL object store was configured.
+    pub(crate) wal_object_store: Option<Arc<dyn ObjectStore>>,
     /// The system clock to use for operations.
     pub(crate) system_clock: Arc<dyn SystemClock>,
     /// The random number generator to use for randomness.
     pub(crate) rand: Arc<DbRand>,
+    /// The retry policy applied to admin object-store operations.
+    pub(crate) object_store_max_retries: Option<u32>,
     #[cfg(feature = "compaction_filters")]
     pub(crate) compaction_filter_supplier:
         Option<Arc<dyn crate::compaction_filter::CompactionFilterSupplier>>,
+    pub(crate) merge_operator: Option<MergeOperatorType>,
+    pub(crate) wal_admin: Arc<dyn WalAdmin>,
 }
 
 impl Admin {
@@ -66,10 +78,7 @@ impl Admin {
         &self,
         maybe_id: Option<u64>,
     ) -> Result<Option<VersionedManifest>, crate::Error> {
-        let manifest_store = ManifestStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        );
+        let manifest_store = self.manifest_store();
         let manifest = if let Some(id) = maybe_id {
             manifest_store
                 .try_read_manifest(id)
@@ -94,21 +103,28 @@ impl Admin {
         &self,
         range: R,
     ) -> Result<Vec<VersionedManifest>, crate::Error> {
-        let manifest_store = ManifestStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        );
+        let manifest_store = self.manifest_store();
         let manifest_metadata = manifest_store
             .list_manifests(range)
             .await
             .map_err(crate::Error::from)?;
         let mut manifests = Vec::with_capacity(manifest_metadata.len());
         for metadata in manifest_metadata {
-            let manifest = manifest_store
-                .read_manifest(metadata.id)
+            match manifest_store
+                .try_read_manifest(metadata.id)
                 .await
-                .map_err(crate::Error::from)?;
-            manifests.push(VersionedManifest::from_manifest(metadata.id, manifest));
+                .map_err(crate::Error::from)?
+            {
+                Some(manifest) => {
+                    manifests.push(VersionedManifest::from_manifest(metadata.id, manifest))
+                }
+                // Deleted after LIST by a concurrent GC
+                // See https://github.com/slatedb/slatedb/issues/1215 for more details.
+                None => log::warn!(
+                    "listed manifest missing on read, skipping [id={}]",
+                    metadata.id
+                ),
+            }
         }
         Ok(manifests)
     }
@@ -181,10 +197,7 @@ impl Admin {
 
     /// Returns a read-only view of the current compactor state.
     pub async fn read_compactor_state_view(&self) -> Result<CompactorStateView, crate::Error> {
-        let manifest_store = Arc::new(ManifestStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        ));
+        let manifest_store = Arc::new(self.manifest_store());
         let compactions_store = Arc::new(self.compactions_store());
         let reader = CompactorStateReader::new(&manifest_store, &compactions_store);
         reader.read_view().await.map_err(crate::Error::from)
@@ -247,10 +260,7 @@ impl Admin {
         &self,
         name_filter: Option<&str>,
     ) -> Result<Vec<Checkpoint>, crate::Error> {
-        let manifest_store = ManifestStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        );
+        let manifest_store = self.manifest_store();
         let manifest = manifest_store
             .read_latest_manifest()
             .await
@@ -287,10 +297,11 @@ impl Admin {
     pub async fn run_gc_once(&self, gc_opts: GarbageCollectorOptions) -> Result<(), crate::Error> {
         let gc = GarbageCollectorBuilder::new(
             self.path.clone(),
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.object_store(ObjectStoreType::Main).clone(),
         )
         .with_system_clock(self.system_clock.clone())
-        .with_wal_object_store(self.object_stores.store_of(ObjectStoreType::Wal).clone())
+        .with_wal_gc(self.wal_admin.garbage_collector(&self.path))
+        .with_wal_object_store(self.object_store(ObjectStoreType::Wal).clone())
         .with_options(gc_opts)
         .with_seed(self.rand.rng().next_u64())
         .build();
@@ -320,10 +331,11 @@ impl Admin {
     ) -> Result<(), crate::Error> {
         let gc = GarbageCollectorBuilder::new(
             self.path.clone(),
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.object_store(ObjectStoreType::Main).clone(),
         )
         .with_system_clock(self.system_clock.clone())
-        .with_wal_object_store(self.object_stores.store_of(ObjectStoreType::Wal).clone())
+        .with_wal_gc(self.wal_admin.garbage_collector(&self.path))
+        .with_wal_object_store(self.object_store(ObjectStoreType::Wal).clone())
         .with_options(gc_opts)
         .with_seed(self.rand.rng().next_u64())
         .build();
@@ -368,7 +380,7 @@ impl Admin {
         #[allow(unused_mut)]
         let mut builder = crate::CompactorBuilder::new(
             self.path.clone(),
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.object_store(ObjectStoreType::Main).clone(),
         )
         .with_options(options)
         .with_system_clock(self.system_clock.clone())
@@ -377,6 +389,10 @@ impl Admin {
         #[cfg(feature = "compaction_filters")]
         if let Some(supplier) = &self.compaction_filter_supplier {
             builder = builder.with_compaction_filter_supplier(supplier.clone());
+        }
+
+        if let Some(merge_operator) = &self.merge_operator {
+            builder = builder.with_merge_operator(merge_operator.clone());
         }
 
         let compactor = builder.build();
@@ -425,7 +441,7 @@ impl Admin {
         #[allow(unused_mut)]
         let mut builder = crate::CompactionWorkerBuilder::new(
             self.path.clone(),
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.object_store(ObjectStoreType::Main).clone(),
         )
         .with_options(options)
         .with_system_clock(self.system_clock.clone())
@@ -456,9 +472,9 @@ impl Admin {
     /// If you have a [`crate::Db`] instance open, you can use the [`crate::Db::create_checkpoint`]
     /// method instead. That method will flush the memtables and WALs before creating the checkpoint.
     ///
-    /// If you're using a [`crate::DbReader`], you might wish to have the reader manage the checkpoint
-    /// for you by calling [`crate::DbReader::open`] with no `checkpoint_id` set. The reader will
-    /// create a checkpoint for you and periodically refresh it.
+    /// If you're using a [`crate::DbReader`], you might wish to use
+    /// [`crate::DbReaderMode::ManagedCheckpoint`]. The reader will create a checkpoint for you and
+    /// periodically refresh it.
     ///
     /// # Examples
     ///
@@ -489,14 +505,11 @@ impl Admin {
         &self,
         options: &CheckpointOptions,
     ) -> Result<CheckpointCreateResult, crate::Error> {
-        let manifest_store = Arc::new(ManifestStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        ));
+        let manifest_store = Arc::new(self.manifest_store());
         let mut stored_manifest =
             StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
 
-        let configured_wal_uri = self.object_stores.has_wal_object_store().then(String::new);
+        let configured_wal_uri = self.wal_object_store.is_some().then(String::new);
         stored_manifest
             .db_state()
             .validate_wal_object_store_uri(configured_wal_uri.as_deref())?;
@@ -520,10 +533,7 @@ impl Admin {
         id: Uuid,
         lifetime: Option<Duration>,
     ) -> Result<(), crate::Error> {
-        let manifest_store = Arc::new(ManifestStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        ));
+        let manifest_store = Arc::new(self.manifest_store());
         let mut stored_manifest =
             StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
         stored_manifest
@@ -547,10 +557,7 @@ impl Admin {
 
     /// Deletes the checkpoint with the specified id.
     pub async fn delete_checkpoint(&self, id: Uuid) -> Result<(), crate::Error> {
-        let manifest_store = Arc::new(ManifestStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        ));
+        let manifest_store = Arc::new(self.manifest_store());
         let mut stored_manifest =
             StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
         stored_manifest
@@ -569,6 +576,122 @@ impl Admin {
             })
             .await
             .map_err(Into::into)
+    }
+
+    /// Deletes a database, stripping any checkpoints it pinned in parent
+    /// databases (a clone) before removing its own objects. Works for plain and
+    /// cloned dbs alike: a plain db just has no parent checkpoints to strip.
+    ///
+    /// Without `confirm` this is a dry run: it returns every object it *would*
+    /// delete and touches nothing. Pass `confirm` to actually delete.
+    ///
+    /// The delete writes a `.deleting` marker while the manifest still proves
+    /// this is a slatedb dir, then removes everything else, then the marker. If a
+    /// prior run crashed mid-delete, the leftover marker lets a rerun finish the
+    /// job. A `confirm` delete of a dir with neither a manifest nor a marker is
+    /// refused, so a fat-fingered `--path` can't wipe an unrelated directory.
+    /// Idempotent.
+    pub async fn delete_db(&self, confirm: bool) -> Result<Vec<String>, crate::Error> {
+        let main = self.retrying_store(ObjectStoreType::Main);
+
+        if !confirm {
+            return self.list_prefix(&main).await;
+        }
+
+        let marker = self.path.clone().join(".deleting");
+        let marker_exists = main.get(&marker).await.map(|_| true).or_else(|e| match e {
+            object_store::Error::NotFound { .. } => Ok(false),
+            other => Err(SlateDBError::from(other)),
+        })?;
+
+        let manifest = self.manifest_store().try_read_latest_manifest().await?;
+
+        // No manifest and no marker means we never proved this is a slatedb dir.
+        // If there are objects under the prefix, it may be a fat-fingered path we
+        // must not wipe, so refuse. If empty, there's nothing to delete anyway
+        // (also the already-deleted no-op), so fall through to a clean return.
+        if manifest.is_none()
+            && !marker_exists
+            && !collect_prefix(&main, &self.path).await?.is_empty()
+        {
+            return Err(SlateDBError::InvalidDBState.into());
+        }
+
+        // Strip the checkpoints this db pinned in each parent. Needs the
+        // manifest, which a resumed (marker-only) run may no longer have.
+        if let Some(manifest) = manifest.as_ref() {
+            for external_db in manifest.external_dbs() {
+                let Some(final_checkpoint_id) = external_db.final_checkpoint_id else {
+                    continue;
+                };
+                let parent_store = Arc::new(ManifestStore::new(
+                    &Path::from(external_db.path.as_str()),
+                    self.retrying_store(ObjectStoreType::Main),
+                ));
+                let mut parent =
+                    match StoredManifest::load(parent_store, self.system_clock.clone()).await {
+                        Ok(parent) => parent,
+                        // parent already deleted: no checkpoint left to strip, skip it
+                        Err(SlateDBError::LatestTransactionalObjectVersionMissing) => continue,
+                        Err(e) => return Err(e.into()),
+                    };
+                parent.delete_checkpoint(final_checkpoint_id).await?;
+            }
+        }
+
+        // Commit the intent to delete while the manifest still proves this dir.
+        if !marker_exists {
+            main.put(&marker, Bytes::new().into())
+                .await
+                .map_err(SlateDBError::from)?;
+        }
+
+        // Delete everything but the marker, then the marker last, so a crash in
+        // between leaves the marker to prove a rerun should finish.
+        let mut deleted = self.delete_prefix(&main, Some(&marker)).await?;
+        deleted.extend(
+            self.wal_admin
+                .delete_wal(&self.path, false)
+                .await
+                .map_err(SlateDBError::from)?,
+        );
+        main.delete(&marker).await.map_err(SlateDBError::from)?;
+        deleted.push(marker.to_string());
+        Ok(deleted)
+    }
+
+    /// Lists every object under this db's path prefix across the main and WAL stores.
+    async fn list_prefix(&self, main: &Arc<dyn ObjectStore>) -> Result<Vec<String>, crate::Error> {
+        let paths = collect_prefix(main, &self.path).await?;
+        // track the dry run paths in a set since the WAL and db may overlap
+        let mut paths = paths.iter().map(Path::to_string).collect::<BTreeSet<_>>();
+        let wal_paths = self
+            .wal_admin
+            .delete_wal(&self.path, true)
+            .await
+            .map_err(SlateDBError::from)?;
+        for wp in wal_paths {
+            paths.insert(wp);
+        }
+        Ok(paths.into_iter().collect())
+    }
+
+    /// Deletes every object under this db's path prefix in the given store,
+    /// skipping `keep` if set. Returns the deleted paths.
+    async fn delete_prefix(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        keep: Option<&Path>,
+    ) -> Result<Vec<String>, crate::Error> {
+        let mut deleted = Vec::new();
+        for path in collect_prefix(store, &self.path).await? {
+            if Some(&path) == keep {
+                continue;
+            }
+            store.delete(&path).await.map_err(SlateDBError::from)?;
+            deleted.push(path);
+        }
+        Ok(deleted.into_iter().map(|p| p.to_string()).collect())
     }
 
     /// Returns the timestamp or sequence from the latest manifest's sequence tracker.
@@ -615,18 +738,37 @@ impl Admin {
         Ok(manifest.core().sequence_tracker.find_seq(ts, opt))
     }
 
+    /// Wraps the configured object store of the given type in a
+    /// [`RetryingObjectStore`] so that admin operations retry transient object
+    /// store failures with exponential backoff. Retrying is safe here because
+    /// `RetryingObjectStore` verifies conditional puts via a ULID written to
+    /// object metadata, so an ambiguous failure after a successful write is
+    /// detected rather than surfaced as a spurious error.
+    fn retrying_store(&self, store_type: ObjectStoreType) -> Arc<dyn ObjectStore> {
+        Arc::new(RetryingObjectStore::new(
+            self.object_store(store_type).clone(),
+            self.rand.clone(),
+            self.system_clock.clone(),
+            self.object_store_max_retries,
+        ))
+    }
+
+    fn object_store(&self, store_type: ObjectStoreType) -> &Arc<dyn ObjectStore> {
+        match store_type {
+            ObjectStoreType::Main => &self.main_object_store,
+            ObjectStoreType::Wal => self
+                .wal_object_store
+                .as_ref()
+                .unwrap_or(&self.main_object_store),
+        }
+    }
+
     fn manifest_store(&self) -> ManifestStore {
-        ManifestStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        )
+        ManifestStore::new(&self.path, self.retrying_store(ObjectStoreType::Main))
     }
 
     fn compactions_store(&self) -> CompactionsStore {
-        CompactionsStore::new(
-            &self.path,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
-        )
+        CompactionsStore::new(&self.path, self.retrying_store(ObjectStoreType::Main))
     }
 
     /// Clone a database using a builder pattern. If no db already exists at the specified path,
@@ -641,6 +783,8 @@ impl Admin {
     /// already set on it is preserved.  This matters when multiple sources are combined via
     /// [`CloneBuilder::with_source`]: each source must carry its own per-source range so that
     /// [`crate::manifest::Manifest::cloned_from_union`] sees non-overlapping effective ranges.
+    ///
+    /// Segmented sources only have to be non-overlapping within each segment that they share.
     ///
     /// # Examples
     ///
@@ -671,9 +815,9 @@ impl Admin {
         CloneBuilder::new(
             self.path.clone(),
             source,
-            self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.retrying_store(ObjectStoreType::Main),
         )
-        .with_wal_object_store(self.object_stores.store_of(ObjectStoreType::Wal).clone())
+        .with_wal_admin(self.wal_admin.clone())
     }
 
     /// Creates a new builder for an admin client at the given path.
@@ -727,7 +871,7 @@ fn get_env_variable(name: &str) -> Result<String, SlateDBError> {
 /// | Memory | `memory` | [load_memory] |
 /// | AWS | `aws` | [load_aws] |
 /// | Azure | `azure` | [load_azure] |
-/// | OpenDAL | `opendal` | [load_opendal] |
+/// | GCP | `gcp` | [load_gcp] |
 pub fn load_object_store_from_env(
     env_file: Option<String>,
 ) -> Result<Arc<dyn ObjectStore>, crate::Error> {
@@ -740,8 +884,8 @@ pub fn load_object_store_from_env(
         "aws" => load_aws(),
         #[cfg(feature = "azure")]
         "azure" => load_azure(),
-        #[cfg(feature = "opendal")]
-        "opendal" => load_opendal(),
+        #[cfg(feature = "gcp")]
+        "gcp" => load_gcp(),
         invalid_value => Err(SlateDBError::InvalidEnvironmentVariable {
             key: "CLOUD_PROVIDER".to_string(),
             value: Some(invalid_value.to_string()),
@@ -803,58 +947,37 @@ pub fn load_azure() -> Result<Arc<dyn ObjectStore>, crate::Error> {
     })?) as Arc<dyn ObjectStore>)
 }
 
-/// Loads an OpenDAL Object store instance.
-///
-/// | Env Variable | Doc | Required |
-/// |--------------|-----|----------|
-/// | OPENDAL_SCHEME | The OpenDAL scheme to use | Yes |
-/// | OPENDAL_* | The OpenDAL configuration | Yes |
-/// full list of schemes: https://docs.rs/opendal/latest/opendal/services/index.html
-/// for example, to use s3-compatible storage, you can set:
-/// ```bash
-/// OPENDAL_SCHEME=s3
-/// OPENDAL_ENDPOINT=http://localhost:9000
-/// OPENDAL_ACCESS_KEY_ID=minioadmin
-/// OPENDAL_SECRET_ACCESS_KEY=minioadmin
-/// OPENDAL_BUCKET=test
-/// OPENDAL_REGION=us-east-1
-/// OPENDAL_ROOT=/tmp
-/// ```
-/// full list of config: https://docs.rs/opendal/latest/opendal/services/s3/config/struct.S3Config.html
-/// for example, to use oss, you can set:
-/// ```bash
-/// OPENDAL_SCHEME=oss
-/// OPENDAL_ENDPOINT=http://oss-cn-shanghai.aliyuncs.com
-/// OPENDAL_ACCESS_KEY_ID=your-access-key-id
-/// OPENDAL_ACCESS_KEY_SECRET=your-access-key-secret
-/// OPENDAL_BUCKET=your-bucket-name
-/// OPENDAL_ROOT=/your/root/path
-/// ```
-/// full list of config: https://docs.rs/opendal/latest/opendal/services/oss/config/struct.OssConfig.html
-#[cfg(feature = "opendal")]
-pub fn load_opendal() -> Result<Arc<dyn ObjectStore>, crate::Error> {
-    use opendal::Operator;
-    use std::collections::HashMap;
+/// Loads a Google Cloud Storage object store instance. The environment variables
+/// consumed are the same as those supported by [`GoogleCloudStorageBuilder::from_env`].
+/// Refer to the builder documentation for the full list and meaning of supported variables:
+/// <https://docs.rs/object_store/latest/object_store/gcp/struct.GoogleCloudStorageBuilder.html#method.with_config>
+#[cfg(feature = "gcp")]
+pub fn load_gcp() -> Result<Arc<dyn ObjectStore>, crate::Error> {
+    let builder = object_store::gcp::GoogleCloudStorageBuilder::from_env();
+    Ok(Arc::new(builder.build().map_err(|error| {
+        SlateDBError::ObjectStoreError(Arc::new(object_store::Error::Generic {
+            store: "GoogleCloudStorage",
+            source: Box::new(error),
+        }))
+    })?) as Arc<dyn ObjectStore>)
+}
 
-    let scheme_value = get_env_variable("OPENDAL_SCHEME")?;
-    let iter = env::vars()
-        .filter_map(|(k, v)| k.strip_prefix("OPENDAL_").map(|k| (k.to_lowercase(), v)))
-        .collect::<HashMap<String, String>>();
-
-    let op = Operator::via_iter(&scheme_value, iter).map_err(|error| {
-        if error.kind() == opendal::ErrorKind::Unsupported {
-            SlateDBError::InvalidEnvironmentVariable {
-                key: "OPENDAL_SCHEME".to_string(),
-                value: Some(scheme_value.clone()),
-            }
-        } else {
-            SlateDBError::ObjectStoreError(Arc::new(object_store::Error::Generic {
-                store: "OpenDAL",
-                source: Box::new(error),
-            }))
-        }
-    })?;
-    Ok(Arc::new(object_store_opendal::OpendalStore::new(op)) as Arc<dyn ObjectStore>)
+/// Collects every object path under `prefix` in the given store.
+async fn collect_prefix(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &Path,
+) -> Result<Vec<Path>, crate::Error> {
+    let mut listing = store.list(Some(prefix));
+    let mut paths = Vec::new();
+    while let Some(meta) = listing
+        .next()
+        .await
+        .transpose()
+        .map_err(SlateDBError::from)?
+    {
+        paths.push(meta.location);
+    }
+    Ok(paths)
 }
 
 #[cfg(test)]
@@ -862,10 +985,12 @@ mod tests {
     use crate::admin::{load_object_store_from_env, AdminBuilder};
     use crate::compactions_store::{CompactionsStore, StoredCompactions};
     use crate::compactor_state::{Compaction, CompactionSpec, CompactionStatus, SourceId};
-    use crate::config::{CompactionWorkerOptions, CompactorOptions, GarbageCollectorOptions};
+    use crate::config::{
+        CheckpointOptions, CompactionWorkerOptions, CompactorOptions, GarbageCollectorOptions,
+    };
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use crate::manifest::ManifestCore;
-    use crate::test_utils::FlakyObjectStore;
+    use crate::test_utils::{FlakyObjectStore, StringConcatMergeOperator};
     use crate::ErrorKind;
     use object_store::memory::InMemory;
     use object_store::path::Path;
@@ -905,23 +1030,6 @@ mod tests {
             let store = r.expect("expected memory object store");
             assert_eq!(store.to_string(), "InMemory");
 
-            Ok(())
-        });
-    }
-
-    #[cfg(feature = "opendal")]
-    #[test]
-    fn test_load_opendal_invalid_scheme_maps_to_invalid_environment_variable() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("OPENDAL_SCHEME", "not-a-scheme");
-
-            let err = super::load_opendal().expect_err("expected invalid OpenDAL scheme");
-
-            assert_eq!(err.kind(), ErrorKind::Invalid);
-            assert_eq!(
-                err.to_string(),
-                "Invalid error: invalid environment variable OPENDAL_SCHEME value `not-a-scheme`"
-            );
             Ok(())
         });
     }
@@ -1125,19 +1233,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_admin_list_manifests_list_failure_maps_to_unavailable() {
+    async fn test_admin_list_manifests_retries_transient_failure() {
+        // Admin operations wrap the object store in a RetryingObjectStore, so a
+        // transient list failure should be retried rather than surfaced.
         let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let object_store: Arc<dyn ObjectStore> =
-            Arc::new(FlakyObjectStore::new(inner, 0).with_list_failures(1, 0));
-        let path = Path::from("/tmp/test_admin_list_manifests_list_failure");
-        let admin = AdminBuilder::new(path, object_store).build();
+        let flaky = Arc::new(FlakyObjectStore::new(inner, 0).with_list_failures(1, 0));
+        let path = Path::from("/tmp/test_admin_list_manifests_retries_transient_failure");
+        let admin = AdminBuilder::new(path, flaky.clone()).build();
 
-        let err = admin
+        let manifests = admin
             .list_manifests(..)
             .await
-            .expect_err("expected list failure");
+            .expect("list should succeed after retrying the transient failure");
+
+        assert!(manifests.is_empty());
+        // 1 transient failure + 1 successful retry.
+        assert_eq!(flaky.list_attempts(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_admin_create_detached_checkpoint_retries_transient_put() {
+        // A transient put failure during checkpoint creation should be retried
+        // by the RetryingObjectStore rather than failing the operation.
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_admin_create_detached_checkpoint_retries_transient_put");
+        let db = crate::Db::open(path.clone(), inner.clone()).await.unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        db.close().await.unwrap();
+
+        // Fail the first put_opts, which the retrying store should transparently retry.
+        let flaky = Arc::new(FlakyObjectStore::new(inner, 1));
+        let admin = AdminBuilder::new(path, flaky.clone()).build();
+
+        admin
+            .create_detached_checkpoint(&CheckpointOptions::default())
+            .await
+            .expect("checkpoint should succeed after retrying the transient put");
+
+        assert!(flaky.put_attempts() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_admin_terminal_object_store_error_maps_to_unavailable() {
+        // The retry layer retries transient errors forever, so it never exhausts
+        // and surfaces a transient failure. A terminal (non-retryable) error,
+        // however, must still pass through the retry wrapper and map to
+        // ErrorKind::Unavailable rather than being swallowed. A conditional put
+        // that always fails with Precondition is such a terminal error.
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_admin_terminal_object_store_error_maps_to_unavailable");
+        let db = crate::Db::open(path.clone(), inner.clone()).await.unwrap();
+        db.put(b"key", b"value").await.unwrap();
+        db.close().await.unwrap();
+
+        let failing = Arc::new(FlakyObjectStore::new(inner, 0).with_put_precondition_always());
+        let admin = AdminBuilder::new(path, failing.clone()).build();
+
+        let err = admin
+            .create_detached_checkpoint(&CheckpointOptions::default())
+            .await
+            .expect_err("expected terminal precondition failure to surface");
 
         assert_eq!(err.kind(), ErrorKind::Unavailable);
+        // Terminal error: attempted exactly once, no retries.
+        assert_eq!(failing.put_attempts(), 1);
     }
 
     #[tokio::test]
@@ -1358,6 +1517,16 @@ mod tests {
         assert!(admin.compaction_filter_supplier.is_some());
     }
 
+    #[test]
+    fn test_admin_builder_with_merge_operator() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let admin = AdminBuilder::new("/tmp/test_merge_operator", object_store)
+            .with_merge_operator(Arc::new(StringConcatMergeOperator))
+            .build();
+
+        assert!(admin.merge_operator.is_some());
+    }
+
     #[tokio::test]
     async fn test_create_clone_builder() {
         use crate::admin::CloneSourceSpec;
@@ -1385,6 +1554,291 @@ mod tests {
         assert!(manifest.is_ok(), "cloned manifest should exist");
     }
 
+    #[tokio::test]
+    async fn test_delete_db_removes_checkpoint_from_parent() {
+        use crate::admin::CloneSourceSpec;
+        use crate::config::CheckpointOptions;
+        use crate::manifest::store::{ManifestStore, StoredManifest};
+        use crate::Db;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let system_clock = Arc::new(DefaultSystemClock::new());
+        let parent_path = Path::from("/tmp/test_cleanup_parent");
+        let clone_path = Path::from("/tmp/test_cleanup_clone");
+
+        let parent_db = Db::open(parent_path.clone(), object_store.clone())
+            .await
+            .unwrap();
+        parent_db.close().await.unwrap();
+
+        // An unrelated checkpoint in the parent that cleanup must not touch.
+        let parent_admin = AdminBuilder::new(parent_path.clone(), object_store.clone()).build();
+        let unrelated = parent_admin
+            .create_detached_checkpoint(&CheckpointOptions::default())
+            .await
+            .unwrap()
+            .id;
+
+        let clone_admin = AdminBuilder::new(clone_path.clone(), object_store.clone()).build();
+        clone_admin
+            .create_clone_builder_from_source(CloneSourceSpec::new(parent_path.clone()))
+            .build()
+            .await
+            .expect("clone should succeed");
+
+        // The checkpoint the clone pinned in the parent.
+        let clone_ms = Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
+        let clone_stored = StoredManifest::load(clone_ms, system_clock.clone())
+            .await
+            .unwrap();
+        let pinned = clone_stored.manifest().external_dbs[0]
+            .final_checkpoint_id
+            .expect("clone pins a final_checkpoint_id in the parent");
+
+        let read_parent_checkpoints = || {
+            let object_store = object_store.clone();
+            let system_clock = system_clock.clone();
+            let parent_path = parent_path.clone();
+            async move {
+                let ms = Arc::new(ManifestStore::new(&parent_path, object_store));
+                let stored = StoredManifest::load(ms, system_clock).await.unwrap();
+                stored
+                    .manifest()
+                    .core
+                    .checkpoints
+                    .iter()
+                    .map(|c| c.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let before = read_parent_checkpoints().await;
+        assert!(
+            before.contains(&pinned),
+            "parent should have pinned checkpoint before cleanup"
+        );
+        assert!(
+            before.contains(&unrelated),
+            "parent should have unrelated checkpoint"
+        );
+
+        clone_admin
+            .delete_db(true)
+            .await
+            .expect("delete should succeed");
+
+        let after = read_parent_checkpoints().await;
+        assert!(
+            !after.contains(&pinned),
+            "pinned checkpoint should be gone from parent"
+        );
+        assert!(
+            after.contains(&unrelated),
+            "unrelated checkpoint should remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_db_deletes_clone_after_parent_already_gone() {
+        use crate::admin::CloneSourceSpec;
+        use crate::Db;
+        use futures::StreamExt;
+        use object_store::ObjectStoreExt;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_delete_orphan_parent");
+        let clone_path = Path::from("/tmp/test_delete_orphan_clone");
+
+        Db::open(parent_path.clone(), object_store.clone())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+
+        let clone_admin = AdminBuilder::new(clone_path.clone(), object_store.clone()).build();
+        clone_admin
+            .create_clone_builder_from_source(CloneSourceSpec::new(parent_path.clone()))
+            .build()
+            .await
+            .expect("clone should succeed");
+
+        // Wipe the parent out from under the clone. The clone still names it in
+        // external_dbs with a pinned checkpoint, but the parent manifest is gone.
+        let mut parent_listing = object_store.list(Some(&parent_path));
+        while let Some(meta) = parent_listing.next().await {
+            object_store.delete(&meta.unwrap().location).await.unwrap();
+        }
+
+        // A missing parent means there is no checkpoint left to strip, so the
+        // clone must still be deletable rather than wedged on a Data error.
+        clone_admin
+            .delete_db(true)
+            .await
+            .expect("clone should delete even with parent already gone");
+        assert_eq!(
+            object_store.list(Some(&clone_path)).count().await,
+            0,
+            "clone objects should be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_db_deletes_own_objects_only_with_confirm() {
+        use crate::admin::CloneSourceSpec;
+        use crate::Db;
+        use futures::StreamExt;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_delete_confirm_parent");
+        let clone_path = Path::from("/tmp/test_delete_confirm_clone");
+
+        Db::open(parent_path.clone(), object_store.clone())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+
+        let clone_admin = AdminBuilder::new(clone_path.clone(), object_store.clone()).build();
+        clone_admin
+            .create_clone_builder_from_source(CloneSourceSpec::new(parent_path.clone()))
+            .build()
+            .await
+            .expect("clone should succeed");
+
+        let count_under = |prefix: Path| {
+            let object_store = object_store.clone();
+            async move { object_store.list(Some(&prefix)).count().await }
+        };
+
+        let initial = count_under(clone_path.clone()).await;
+        assert!(initial > 0, "clone should have objects");
+
+        // confirm = false is a dry run: it reports what it would delete and
+        // touches nothing.
+        let would_delete = clone_admin
+            .delete_db(false)
+            .await
+            .expect("dry run should succeed");
+        assert_eq!(
+            would_delete.len(),
+            initial,
+            "dry run should report every object under the prefix"
+        );
+        assert_eq!(
+            count_under(clone_path.clone()).await,
+            initial,
+            "dry run must not delete anything"
+        );
+
+        // confirm = true deletes the clone's own objects.
+        clone_admin
+            .delete_db(true)
+            .await
+            .expect("delete should succeed");
+        assert_eq!(
+            count_under(clone_path.clone()).await,
+            0,
+            "clone objects should be gone after confirm"
+        );
+
+        // Idempotent: a second run over an already-deleted db is a clean no-op.
+        clone_admin
+            .delete_db(true)
+            .await
+            .expect("second delete should be a no-op");
+    }
+
+    #[tokio::test]
+    async fn test_delete_db_finishes_partial_deletion_via_marker() {
+        use crate::admin::CloneSourceSpec;
+        use crate::Db;
+        use futures::StreamExt;
+        use object_store::ObjectStoreExt;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_delete_partial_parent");
+        let clone_path = Path::from("/tmp/test_delete_partial_clone");
+
+        Db::open(parent_path.clone(), object_store.clone())
+            .await
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
+
+        let clone_admin = AdminBuilder::new(clone_path.clone(), object_store.clone()).build();
+        clone_admin
+            .create_clone_builder_from_source(CloneSourceSpec::new(parent_path.clone()))
+            .build()
+            .await
+            .expect("clone should succeed");
+
+        // Simulate a crash mid-delete: the marker was written, then the manifests
+        // (and some objects) were removed, but the marker and other objects remain.
+        object_store
+            .put(
+                &clone_path.clone().join(".deleting"),
+                bytes::Bytes::new().into(),
+            )
+            .await
+            .unwrap();
+        let manifest_prefix = Path::from("/tmp/test_delete_partial_clone/manifest");
+        let mut listing = object_store.list(Some(&manifest_prefix));
+        while let Some(meta) = listing.next().await {
+            object_store.delete(&meta.unwrap().location).await.unwrap();
+        }
+        let count_under = |prefix: Path| {
+            let object_store = object_store.clone();
+            async move { object_store.list(Some(&prefix)).count().await }
+        };
+        assert!(
+            count_under(clone_path.clone()).await > 0,
+            "leftover clone objects should remain after partial deletion"
+        );
+
+        // The marker proves this is a real slatedb dir, so delete resumes and
+        // finishes the job even though the manifest is already gone.
+        clone_admin
+            .delete_db(true)
+            .await
+            .expect("delete should finish partial deletion");
+        assert_eq!(
+            count_under(clone_path.clone()).await,
+            0,
+            "leftover objects, including the marker, should be gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_db_refuses_without_manifest_or_marker() {
+        use futures::StreamExt;
+        use object_store::ObjectStoreExt;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let dir = Path::from("/tmp/test_delete_fat_finger");
+
+        // A directory that is NOT a slatedb dir: no manifest, no .deleting marker.
+        // This stands in for a fat-fingered --path.
+        object_store
+            .put(
+                &dir.clone().join("important.txt"),
+                bytes::Bytes::from_static(b"keepme").into(),
+            )
+            .await
+            .unwrap();
+
+        let admin = AdminBuilder::new(dir.clone(), object_store.clone()).build();
+        admin
+            .delete_db(true)
+            .await
+            .expect_err("delete must refuse a dir with no manifest and no marker");
+
+        let count = object_store.list(Some(&dir)).count().await;
+        assert_eq!(count, 1, "the unrelated object must be left untouched");
+    }
+
     #[cfg(feature = "wal_disable")]
     #[tokio::test]
     async fn test_create_clone_with_multiple_sources() {
@@ -1404,7 +1858,6 @@ mod tests {
             ..Settings::default()
         };
         let write_opts = WriteOptions {
-            await_durable: false,
             ..Default::default()
         };
 
@@ -1466,6 +1919,143 @@ mod tests {
             manifest_data.manifest.external_dbs.len(),
             2,
             "clone should have an external database for each parent"
+        );
+    }
+
+    #[cfg(feature = "wal_disable")]
+    #[tokio::test]
+    async fn test_delete_db_removes_checkpoints_from_all_parents() {
+        use crate::config::{PutOptions, Settings, WriteOptions};
+        use crate::manifest::store::{ManifestStore, StoredManifest};
+        use crate::{admin::CloneSourceSpec, Db};
+        use uuid::Uuid;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let system_clock = Arc::new(DefaultSystemClock::new());
+        let parent_path1 = Path::from("/tmp/test_cleanup_multi_parent1");
+        let parent_path2 = Path::from("/tmp/test_cleanup_multi_parent2");
+        let clone_path = Path::from("/tmp/test_cleanup_multi_clone");
+
+        let settings = Settings {
+            wal_enabled: false,
+            ..Settings::default()
+        };
+        let write_opts = WriteOptions::default();
+
+        // Two parents with disjoint single-key SSTs (the union path rejects overlaps).
+        for (path, key) in [(&parent_path1, b"a"), (&parent_path2, b"z")] {
+            let db = Db::builder(path.clone(), object_store.clone())
+                .with_settings(settings.clone())
+                .build()
+                .await
+                .unwrap();
+            db.put_with_options(key, b"1", &PutOptions::default(), &write_opts)
+                .await
+                .unwrap();
+            db.close().await.unwrap();
+        }
+
+        let clone_admin = AdminBuilder::new(clone_path.clone(), object_store.clone()).build();
+        clone_admin
+            .create_clone_builder_from_source(CloneSourceSpec::new(parent_path1.clone()))
+            .with_source(CloneSourceSpec::new(parent_path2.clone()))
+            .build()
+            .await
+            .expect("clone with multiple sources should succeed");
+
+        // Collect the checkpoint each parent got pinned with.
+        let clone_ms = Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
+        let clone_stored = StoredManifest::load(clone_ms, system_clock.clone())
+            .await
+            .unwrap();
+        let pinned: Vec<(String, Uuid)> = clone_stored
+            .manifest()
+            .external_dbs
+            .iter()
+            .map(|e| (e.path.clone(), e.final_checkpoint_id.unwrap()))
+            .collect();
+        assert_eq!(pinned.len(), 2);
+
+        clone_admin
+            .delete_db(true)
+            .await
+            .expect("delete should succeed");
+
+        for (parent_path, checkpoint_id) in pinned {
+            let ms = Arc::new(ManifestStore::new(
+                &parent_path.into(),
+                object_store.clone(),
+            ));
+            let stored = StoredManifest::load(ms, system_clock.clone())
+                .await
+                .unwrap();
+            assert!(
+                !stored
+                    .manifest()
+                    .core
+                    .checkpoints
+                    .iter()
+                    .any(|c| c.id == checkpoint_id),
+                "pinned checkpoint should be removed from every parent"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod gc_tolerant_list_manifests_tests {
+    use crate::admin::AdminBuilder;
+    use crate::manifest::store::{ManifestStore, StoredManifest};
+    use crate::manifest::ManifestCore;
+    use crate::test_utils::FlakyObjectStore;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::ObjectStore;
+    use slatedb_common::clock::DefaultSystemClock;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_list_manifests_skips_manifest_gced_between_list_and_read() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let flaky = Arc::new(FlakyObjectStore::new(inner, 0));
+        let store: Arc<dyn ObjectStore> = flaky.clone();
+        let path = Path::from("/tmp/test_gc_tolerant_list_manifests");
+
+        let manifest_store = Arc::new(ManifestStore::new(&path, store.clone()));
+        let mut sm = StoredManifest::create_new_db(
+            manifest_store,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        sm.update(sm.prepare_dirty().unwrap()).await.unwrap();
+        sm.update(sm.prepare_dirty().unwrap()).await.unwrap();
+
+        let admin = AdminBuilder::new(path.clone(), store.clone()).build();
+        let ids: Vec<u64> = admin
+            .list_manifests(..)
+            .await
+            .unwrap()
+            .iter()
+            .map(|vm| vm.id())
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        // manifest 1 is listed, but missing on read
+        flaky.with_get_not_found_failures(1);
+
+        let ids: Vec<u64> = admin
+            .list_manifests(..)
+            .await
+            .unwrap()
+            .iter()
+            .map(|vm| vm.id())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "a manifest GC'd mid-listing should be skipped, not fail the operation"
         );
     }
 }
