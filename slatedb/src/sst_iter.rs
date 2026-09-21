@@ -191,7 +191,7 @@ enum FilterState {
 /// might match. An empty `filters` slice means no filter is configured for the
 /// SST; callers treat that as "might match" (do not skip). Shared by the
 /// single-key [`FilterEvaluator`] and the batched `multi_get` path
-/// ([`crate::multi_sst`]).
+/// ([`crate::multi_get`]).
 pub(crate) fn all_filters_might_match(filters: &[NamedFilter], query: &FilterQuery) -> bool {
     filters.iter().all(|nf| nf.filter.might_match(query))
 }

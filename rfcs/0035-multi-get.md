@@ -226,7 +226,8 @@ pub struct MultiGetOptions {
     /// Wave 1 always reads one. Default: 4, the lookahead of `get`.
     pub lookahead: usize,
     /// Two blocks go into one ranged GET when the gap between them is at
-    /// most this many bytes. 0 turns merging off. Default: 64 KiB.
+    /// most this many bytes. With 0, only adjacent blocks merge.
+    /// Default: 64 KiB.
     pub coalesce_gap_bytes: usize,
     /// Upper size of one merged ranged GET. Default: 4 MiB.
     pub max_coalesced_bytes: usize,

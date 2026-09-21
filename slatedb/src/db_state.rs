@@ -652,6 +652,13 @@ impl SortedRun {
         let Some(max_idx) = self.find_last_sst_with_range_covering_key(key) else {
             return 0..0;
         };
+        self.point_table_idx_ending_at(key, max_idx)
+    }
+
+    /// The second part of [`Self::point_table_idx_covering_key`]. `max_idx` is
+    /// the last view whose start key is at most `key`. A caller with sorted
+    /// keys finds it with a forward cursor and needs no binary search.
+    pub(crate) fn point_table_idx_ending_at(&self, key: &[u8], max_idx: usize) -> Range<usize> {
         let point_range = BytesRange::from_slice(key..=key);
         if !self.sst_views[max_idx].intersects_range(self.table_end_bound(max_idx), &point_range) {
             return 0..0;

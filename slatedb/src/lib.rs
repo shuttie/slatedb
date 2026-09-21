@@ -147,7 +147,7 @@ mod mem_table;
 mod memtable_flusher;
 mod merge_iterator;
 mod merge_operator;
-mod multi_sst;
+mod multi_get;
 mod ops;
 mod oracle;
 mod partitioned_keyspace;

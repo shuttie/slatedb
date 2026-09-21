@@ -1,7 +1,7 @@
 //! Batched per-SST point reads for `multi_get`.
 //!
 //! A batch visits one SST one time for all the keys that the SST can hold. The
-//! visit has two parts:
+//! plan ([`super::plan`]) selects these keys. The visit has two parts:
 //!
 //! - [`read_from_cache`] runs on the task of the caller. It answers the keys
 //!   whose index and blocks are in the block cache, and it sends no object
@@ -13,7 +13,7 @@
 //!
 //! Both return the raw `RowEntry`s each SST holds for a key, newest
 //! first. Sequence/merge/tombstone resolution is intentionally left to the
-//! orchestrator ([`crate::reader::Reader`]) so the final value is produced by
+//! orchestrator ([`super`]) so the final value is produced by
 //! the exact same components the single-key `get` path uses.
 
 use std::collections::BTreeMap;
@@ -31,7 +31,7 @@ use crate::config::MultiGetOptions;
 use crate::db_state::{SsTableHandle, SsTableView};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
-use crate::filter_policy::{FilterQuery, NamedFilter};
+use crate::filter_policy::{FilterContext, FilterQuery, NamedFilter};
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::iter::IterationOrder;
@@ -45,10 +45,9 @@ use crate::types::RowEntry;
 pub(crate) struct CacheRead {
     /// Entries of the keys that the cache answered.
     pub(crate) found: Vec<(usize, Vec<RowEntry>)>,
-    /// Keys that need [`read_sst`]. The cached filters already pruned them.
+    /// Keys that need [`read_sst`].
     pub(crate) misses: Vec<PendingKey>,
-    /// Cached parts, so that [`read_sst`] does not look them up again.
-    pub(crate) filters: Option<Arc<[NamedFilter]>>,
+    /// The cached index, so that [`read_sst`] does not look it up again.
     pub(crate) index: Option<Arc<SsTableIndexOwned>>,
 }
 
@@ -86,37 +85,27 @@ struct Candidate {
 /// index and each block of its range are in the cache. This function sends no
 /// object store request.
 ///
+/// The plan already pruned `keys` by range and by the cached filters.
+/// `filters_present` says that a filter passed them, for the false positive
+/// stats.
+///
 /// Entries are in sequence-descending (newest-first) order. They are not
 /// sequence-filtered or merge-resolved here.
 pub(crate) async fn read_from_cache(
-    view: &SsTableView,
+    handle: &SsTableHandle,
     keys: &[PendingKey],
+    filters_present: bool,
     table_store: &TableStore,
-    options: &SstIteratorOptions,
     db_stats: Option<&DbStats>,
 ) -> Result<CacheRead, SlateDBError> {
-    let handle = &view.sst;
-    let filters = table_store.cached_filters(handle).await;
-    let survivors = prune_keys(
-        view,
-        keys,
-        filters.as_deref().unwrap_or(&[]),
-        options,
-        db_stats,
-    );
-    let index = if survivors.is_empty() {
-        None
-    } else {
-        table_store.cached_index(handle).await
-    };
+    let survivors: Vec<&PendingKey> = keys.iter().collect();
     let mut read = CacheRead {
         found: Vec::new(),
         misses: Vec::new(),
-        filters,
-        index,
+        index: table_store.cached_index(handle).await,
     };
     let Some(index) = read.index.clone() else {
-        read.misses = survivors.into_iter().cloned().collect();
+        read.misses = keys.to_vec();
         return Ok(read);
     };
     if index.borrow().block_meta().is_empty() {
@@ -129,11 +118,15 @@ pub(crate) async fn read_from_cache(
     for cand in map_candidates(&survivors, &index) {
         let mut cached = true;
         for bi in cand.blocks.clone() {
-            if !lookups.contains_key(&bi) {
-                let block = table_store.cached_block(handle, &index, bi).await;
-                lookups.insert(bi, block);
-            }
-            cached &= lookups[&bi].is_some();
+            cached &= match lookups.get(&bi) {
+                Some(block) => block.is_some(),
+                None => {
+                    let block = table_store.cached_block(handle, &index, bi).await;
+                    let hit = block.is_some();
+                    lookups.insert(bi, block);
+                    hit
+                }
+            };
         }
         if cached {
             hits.push(cand);
@@ -148,7 +141,6 @@ pub(crate) async fn read_from_cache(
         .into_iter()
         .filter_map(|(bi, block)| block.map(|block| (bi, block)))
         .collect();
-    let filters_present = read.filters.as_ref().is_some_and(|f| !f.is_empty());
     read.found = scan_candidates(
         handle.format_version,
         &hits,
@@ -198,7 +190,7 @@ pub(crate) async fn read_sst(
                     sst_level.as_ref(),
                 )
                 .await?;
-            let survivors = prune_keys(&view, &keys, &filters, &options, db_stats);
+            let survivors = filter_keys(&keys, &filters, &options.filter_context, db_stats);
             (filters, survivors)
         }
     };
@@ -254,40 +246,36 @@ async fn request_permit(requests: &Semaphore) -> tokio::sync::SemaphorePermit<'_
         .expect("the request semaphore is never closed")
 }
 
-/// Prune keys by visible range and bloom filter. Filter positives and
-/// negatives are recorded here. False positives are recorded after scanning
-/// (see [`scan_candidates`]).
-fn prune_keys<'a>(
-    view: &SsTableView,
+/// Visible-range projection (segments / clones). For identity views this
+/// also prunes keys outside the SST's physical key range.
+pub(crate) fn view_holds_key(view: &SsTableView, key: &[u8]) -> bool {
+    view.calculate_view_range(BytesRange::from_slice(key..=key))
+        .is_some()
+}
+
+/// Prune keys by bloom filter. Filter positives and negatives are recorded
+/// here. False positives are recorded after scanning (see
+/// [`scan_candidates`]).
+pub(crate) fn filter_keys<'a>(
     keys: &'a [PendingKey],
     filters: &[NamedFilter],
-    options: &SstIteratorOptions,
+    filter_context: &Option<FilterContext>,
     db_stats: Option<&DbStats>,
 ) -> Vec<&'a PendingKey> {
+    if filters.is_empty() {
+        return keys.iter().collect();
+    }
     let mut survivors = Vec::with_capacity(keys.len());
     for pk in keys {
-        // Visible-range projection (segments / clones). For identity views this
-        // also prunes keys outside the SST's physical key range. Keys pruned
-        // here are out of range, not filter false positives, so no stats.
-        if view
-            .calculate_view_range(BytesRange::from_slice(pk.key.as_ref()..=pk.key.as_ref()))
-            .is_none()
-        {
+        let query = FilterQuery::point(pk.key.clone()).with_context(filter_context.clone());
+        if !all_filters_might_match(filters, &query) {
+            if let Some(stats) = db_stats {
+                stats.sst_filter_point_negatives.increment(1);
+            }
             continue;
         }
-
-        if !filters.is_empty() {
-            let query =
-                FilterQuery::point(pk.key.clone()).with_context(options.filter_context.clone());
-            if !all_filters_might_match(filters, &query) {
-                if let Some(stats) = db_stats {
-                    stats.sst_filter_point_negatives.increment(1);
-                }
-                continue;
-            }
-            if let Some(stats) = db_stats {
-                stats.sst_filter_point_positives.increment(1);
-            }
+        if let Some(stats) = db_stats {
+            stats.sst_filter_point_positives.increment(1);
         }
         survivors.push(pk);
     }
@@ -580,10 +568,10 @@ mod tests {
 
         async fn read_from_cache(&self, keys: &[usize]) -> CacheRead {
             read_from_cache(
-                &self.view,
+                &self.view.sst,
                 &pending(keys),
+                true,
                 &self.table_store,
-                &SstIteratorOptions::default(),
                 None,
             )
             .await
@@ -709,7 +697,8 @@ mod tests {
             .await;
         fx.recording.clear();
 
-        // Key 1 is absent. The cached filter removes it.
+        // Key 1 is absent. Its block is in the cache, so it is a hit with no
+        // entries.
         let warm = fx.read_from_cache(&[0, 1, 100, 198]).await;
 
         assert_eq!(found_keys(&warm.found), keys);
@@ -728,11 +717,11 @@ mod tests {
         assert_eq!(found_keys(&cached.found), [0]);
         let missed: Vec<usize> = cached.misses.iter().map(|pk| pk.idx).collect();
         assert_eq!(missed, [198]);
-        assert!(cached.filters.is_some() && cached.index.is_some());
+        assert!(cached.index.is_some());
 
         let mut read = fx.sst_read(&[]);
         read.keys = cached.misses;
-        read.filters = cached.filters;
+        read.filters = fx.table_store.cached_filters(&fx.view.sst).await;
         read.index = cached.index;
         let result = fx.read_sst(read, MultiGetOptions::default()).await;
 
