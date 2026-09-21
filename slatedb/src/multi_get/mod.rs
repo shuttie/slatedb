@@ -137,6 +137,8 @@ impl Reader {
                     }
                     wb_acc[u].push(entry);
                 }
+                // Keep the in-memory walk cooperative.
+                tokio::task::coop::consume_budget().await;
             }
         }
 
@@ -149,7 +151,8 @@ impl Reader {
             &read_trace,
             &mut acc,
             &mut resolved,
-        );
+        )
+        .await;
         for imm in db_state.imm_memtable() {
             read_memtable_layer(
                 &imm.table(),
@@ -158,14 +161,17 @@ impl Reader {
                 &read_trace,
                 &mut acc,
                 &mut resolved,
-            );
+            )
+            .await;
         }
 
         // 3. Plan: the SSTs that can hold each open key. Only filters that are
         //    in the cache take part, so the plan sends no request.
-        let mut ssts = candidate_ssts(db_state.core(), &batch.keys, &resolved);
+        let mut ssts = candidate_ssts(db_state.core(), &batch.keys, &resolved).await;
         for sst in ssts.iter_mut() {
             sst.filters = self.table_store.cached_filters(&sst.view.sst).await;
+            // Keep cached lookups cooperative.
+            tokio::task::coop::consume_budget().await;
         }
         let mut plan = Plan::new(ssts, n, &options.filter_context, Some(&self.db_stats));
         // A key with no candidates has nothing to read.
@@ -211,6 +217,8 @@ impl Reader {
                         key: batch.keys[u].clone(),
                     });
                 }
+                // Keep the wave build cooperative.
+                tokio::task::coop::consume_budget().await;
             }
 
             let results = self
@@ -230,6 +238,8 @@ impl Reader {
                         append_versions(entries, max_seq, &mut acc[u], &mut resolved[u]);
                     }
                 }
+                // Keep the result pass cooperative.
+                tokio::task::coop::consume_budget().await;
             }
             open.retain(|&u| !resolved[u] && !plan.candidates[u].is_empty());
         }
@@ -245,6 +255,8 @@ impl Reader {
                 self.resolve_entry(&batch.keys[u], wb_entries, rest_entries)
                     .await?,
             );
+            // Keep in-memory resolution cooperative.
+            tokio::task::coop::consume_budget().await;
         }
         if keys.len() == n {
             // No duplicates: each value moves to its one slot.
@@ -436,7 +448,7 @@ fn append_versions(
 }
 
 /// Probe an in-memory table for every still-pending key, appending its versions.
-fn read_memtable_layer(
+async fn read_memtable_layer(
     table: &KVTable,
     unique_keys: &[Bytes],
     max_seq: Option<u64>,
@@ -450,6 +462,8 @@ fn read_memtable_layer(
         }
         let entries = kv_table_get_versions(table, key, read_trace);
         append_versions(entries, max_seq, &mut acc[u], &mut resolved[u]);
+        // Keep in-memory lookups cooperative.
+        tokio::task::coop::consume_budget().await;
     }
 }
 

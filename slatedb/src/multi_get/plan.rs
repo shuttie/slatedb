@@ -187,7 +187,7 @@ pub(crate) fn pick_next(candidates: &[Candidate], has_operand: bool, lookahead: 
 
 /// The SSTs that can hold the open keys, newest first inside each LSM tree.
 /// `keys` must be sorted. The `filters` of each SST start as `None`.
-pub(crate) fn candidate_ssts(
+pub(crate) async fn candidate_ssts(
     core: &ManifestCore,
     keys: &[Bytes],
     resolved: &[bool],
@@ -215,11 +215,15 @@ pub(crate) fn candidate_ssts(
                 .cloned()
                 .collect();
             push(view, SstTraceLevel::L0, inside);
+            // Keep the plan pass cooperative.
+            tokio::task::coop::consume_budget().await;
         }
         for run in tree.compacted.iter() {
             for (vi, keys) in merge_join(&keys, run) {
                 push(&run.sst_views()[vi], SstTraceLevel::SortedRun(run.id), keys);
             }
+            // Keep the plan pass cooperative.
+            tokio::task::coop::consume_budget().await;
         }
     }
     ssts
@@ -438,7 +442,8 @@ mod tests {
         &[("a", "z")], &[RUN_2], &["b", "h"], &[true, false],
         vec![("l0:a", vec![1]), ("sr2:g", vec![1])],
     )]
-    fn should_list_candidate_ssts_newest_first(
+    #[tokio::test]
+    async fn should_list_candidate_ssts_newest_first(
         #[case] l0: &[(&str, &str)],
         #[case] runs: &[(u32, &[(&str, &str)])],
         #[case] keys: &[&str],
@@ -448,7 +453,7 @@ mod tests {
         let mut core = ManifestCore::new();
         core.tree = tree(l0, runs);
 
-        let ssts = candidate_ssts(&core, &sorted_keys(keys), resolved);
+        let ssts = candidate_ssts(&core, &sorted_keys(keys), resolved).await;
 
         let expected: Vec<(String, Vec<usize>)> = expected
             .into_iter()
@@ -458,8 +463,8 @@ mod tests {
         assert!(ssts.iter().all(|sst| sst.filters.is_none()));
     }
 
-    #[test]
-    fn should_plan_each_key_inside_its_segment() {
+    #[tokio::test]
+    async fn should_plan_each_key_inside_its_segment() {
         let mut core = ManifestCore::new();
         // The default tree must not take part when segments are set.
         core.tree = tree(&[("a", "z")], &[]);
@@ -475,7 +480,7 @@ mod tests {
         ];
 
         let keys = sorted_keys(&["a/5", "b/5", "c/5"]);
-        let ssts = candidate_ssts(&core, &keys, &[false; 3]);
+        let ssts = candidate_ssts(&core, &keys, &[false; 3]).await;
 
         assert_eq!(
             labels(&ssts),
