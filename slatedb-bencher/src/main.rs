@@ -29,6 +29,7 @@ use tracing_subscriber::EnvFilter;
 use transactions::TransactionBench;
 
 mod args;
+pub mod bench_object_store;
 pub mod db;
 pub mod stats;
 pub mod system_monitor;

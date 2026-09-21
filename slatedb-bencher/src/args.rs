@@ -1,12 +1,16 @@
 use std::{
     fmt::{Display, Formatter},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use clap::{builder::PossibleValue, Args, Parser, Subcommand, ValueEnum};
+use object_store::ObjectStore;
 use slatedb::{
-    config::{CompressionCodec, Settings},
+    config::{CompressionCodec, MultiGetOptions, Settings},
     db_cache::{
         foyer::{FoyerCache, FoyerCacheOptions},
         DbCache, SplitCache,
@@ -15,6 +19,7 @@ use slatedb::{
 };
 use tracing::info;
 
+use crate::bench_object_store::{BenchObjectStore, DelayProfile};
 use crate::db::{FixedSetKeyGenerator, KeyGenerator, RandomKeyGenerator};
 
 #[derive(Parser, Clone)]
@@ -74,16 +79,40 @@ pub(crate) struct DbArgs {
         help = "Use unified cache, we will use `block_cache_size` as unified cache size"
     )]
     pub(crate) unified_cache: bool,
+
+    #[arg(
+        long,
+        help = "Keep the object store disk cache from the configuration file. By default the benchmark disables it, so reads go to the object store.",
+        default_value_t = false
+    )]
+    pub(crate) disk_cache: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        help = "Add a delay to each object store read, sampled from a measured latency profile.",
+        default_value_t = DelayProfileKind::None
+    )]
+    pub(crate) delay_profile: DelayProfileKind,
+
+    #[arg(
+        long,
+        help = "Add a fixed delay in milliseconds to each object store read. Overrides --delay-profile."
+    )]
+    pub(crate) delay_ms: Option<u64>,
 }
 
 impl DbArgs {
     /// Returns a `(Settings, Option<Arc<dyn DbCache>>)` struct based on DbArgs's arguments.
     pub(crate) fn config(&self) -> Result<(Settings, Option<Arc<dyn DbCache>>), Error> {
-        let settings = if let Some(path) = &self.db_options_path {
+        let mut settings = if let Some(path) = &self.db_options_path {
             Settings::from_file(path)?
         } else {
             Settings::load()?
         };
+        if !self.disk_cache {
+            settings.object_store_cache_options.root_folder = None;
+        }
 
         let block_cache = self.block_cache_size.map(|capacity| {
             Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
@@ -111,6 +140,38 @@ impl DbArgs {
         ) as Arc<dyn DbCache>);
 
         Ok((settings, memory_cache))
+    }
+
+    /// Wraps the object store so the benchmark can count and delay reads.
+    pub(crate) fn wrap_store(&self, store: Arc<dyn ObjectStore>) -> Arc<BenchObjectStore> {
+        let profile = match (self.delay_ms, &self.delay_profile) {
+            (Some(millis), _) => Some(DelayProfile::fixed(millis)),
+            (None, DelayProfileKind::None) => None,
+            (None, DelayProfileKind::S3) => Some(DelayProfile::s3()),
+            (None, DelayProfileKind::S3x) => Some(DelayProfile::s3_express()),
+        };
+        Arc::new(BenchObjectStore::new(store, profile))
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub(crate) enum DelayProfileKind {
+    /// No delay.
+    None,
+    /// S3 in one region.
+    S3,
+    /// S3 Express One Zone.
+    S3x,
+}
+
+impl Display for DelayProfileKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            DelayProfileKind::None => "none",
+            DelayProfileKind::S3 => "s3",
+            DelayProfileKind::S3x => "s3x",
+        };
+        write!(f, "{name}")
     }
 }
 
@@ -184,6 +245,103 @@ pub(crate) struct BenchmarkDbArgs {
         default_value_t = false
     )]
     pub(crate) no_compactor: bool,
+
+    #[arg(
+        long,
+        help = "Seed for the key generators. Two runs with the same seed and key count use the same fixed key set."
+    )]
+    pub(crate) seed: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Wait until compaction settles before the database closes.",
+        default_value_t = false
+    )]
+    pub(crate) wait_compaction: bool,
+
+    #[command(subcommand)]
+    pub(crate) mode: Option<DbMode>,
+}
+
+/// The read mode of the `db` benchmark. No mode is a loop of single `get` calls.
+#[derive(Subcommand, Clone)]
+pub(crate) enum DbMode {
+    /// Read keys in batches with `multi_get` or with a loop of `get` calls.
+    Mget(MgetArgs),
+}
+
+#[derive(Args, Clone)]
+pub(crate) struct MgetArgs {
+    #[arg(
+        long,
+        value_enum,
+        help = "How a batch is read.",
+        default_value_t = Reader::MultiGet
+    )]
+    pub(crate) reader: Reader,
+
+    #[arg(long, help = "The number of keys in one batch.", default_value_t = 100)]
+    pub(crate) batch_size: usize,
+
+    #[arg(
+        long,
+        help = "Max object store requests in flight for one batch. The `concurrent` reader runs this many gets at once.",
+        default_value_t = 256
+    )]
+    pub(crate) read_concurrency: usize,
+
+    #[arg(
+        long,
+        help = "Max known-positive SSTs that a key reads in wave 2 and later.",
+        default_value_t = 4
+    )]
+    pub(crate) lookahead: usize,
+
+    #[arg(
+        long,
+        help = "Two blocks go into one ranged GET when the gap between them is at most this many bytes.",
+        default_value_t = 64 * 1024
+    )]
+    pub(crate) coalesce_gap_bytes: usize,
+
+    #[arg(
+        long,
+        help = "Upper size of one merged ranged GET.",
+        default_value_t = 4 * 1024 * 1024
+    )]
+    pub(crate) max_coalesced_bytes: usize,
+}
+
+impl MgetArgs {
+    pub(crate) fn mget_options(&self) -> MultiGetOptions {
+        MultiGetOptions::new()
+            .with_max_fetch_tasks(self.read_concurrency)
+            .with_lookahead(self.lookahead)
+            .with_coalesce_gap_bytes(self.coalesce_gap_bytes)
+            .with_max_coalesced_bytes(self.max_coalesced_bytes)
+    }
+}
+
+/// How the `mget` mode reads one batch of keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum Reader {
+    /// One `get` after the other.
+    Seq,
+    /// Up to `read_concurrency` gets at once.
+    Concurrent,
+    /// One `multi_get` call.
+    MultiGet,
+}
+
+impl Display for Reader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Reader::Seq => "seq",
+            Reader::Concurrent => "concurrent",
+            Reader::MultiGet => "multi-get",
+        };
+        write!(f, "{name}")
+    }
 }
 
 /// Trait for types that can supply key generators
@@ -191,18 +349,33 @@ pub(crate) trait KeyGeneratorSupplier {
     fn key_generator(&self) -> KeyGeneratorType;
     fn key_len(&self) -> usize;
     fn key_count(&self) -> u64;
+    fn seed(&self) -> Option<u64> {
+        None
+    }
 
     fn key_gen_supplier(&self) -> Box<dyn Fn() -> Box<dyn KeyGenerator>> {
         let key_len = self.key_len();
         let key_count = self.key_count();
+        let seed = self.seed();
+        // Each task gets its own pick seed, so the tasks do not read the
+        // same keys in the same order.
+        let tasks = AtomicU64::new(0);
+        let task_seed = move || seed.map(|s| s.wrapping_add(tasks.fetch_add(1, Ordering::Relaxed)));
         let supplier: Box<dyn Fn() -> Box<dyn KeyGenerator>> = match self.key_generator() {
             KeyGeneratorType::Random => {
                 info!(key_len, "using random key generator");
-                Box::new(move || Box::new(RandomKeyGenerator::new(key_len)))
+                Box::new(move || Box::new(RandomKeyGenerator::new(key_len, task_seed())))
             }
             KeyGeneratorType::FixedSet => {
                 info!(key_len, key_count, "using fixed set key generator");
-                Box::new(move || Box::new(FixedSetKeyGenerator::new(key_len, key_count)))
+                Box::new(move || {
+                    Box::new(FixedSetKeyGenerator::new(
+                        key_len,
+                        key_count,
+                        seed,
+                        task_seed(),
+                    ))
+                })
             }
         };
 
@@ -221,6 +394,10 @@ impl KeyGeneratorSupplier for BenchmarkDbArgs {
 
     fn key_count(&self) -> u64 {
         self.key_count
+    }
+
+    fn seed(&self) -> Option<u64> {
+        self.seed
     }
 }
 

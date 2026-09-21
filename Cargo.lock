@@ -3267,6 +3267,7 @@ dependencies = [
 name = "slatedb-bencher"
 version = "0.16.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "clap",
@@ -3275,6 +3276,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_xorshift",
  "slatedb",
+ "slatedb-common",
  "sysinfo",
  "tokio",
  "tracing",
