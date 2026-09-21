@@ -171,22 +171,32 @@ The two short forms call them with default options. This breaks code outside
 SlateDB that implements `DbReadOps`. See [Compatibility](#compatibility).
 
 ```rust
-async fn multi_get<K: AsRef<[u8]> + Send>(
+async fn multi_get<K: AsRef<[u8]> + Send + Sync>(
     &self, keys: &[K],
 ) -> Result<Vec<Option<Bytes>>, Error>;
 
-async fn multi_get_with_options<K: AsRef<[u8]> + Send>(
+async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
     &self, keys: &[K], options: &MultiGetOptions,
 ) -> Result<Vec<Option<Bytes>>, Error>;
 
-async fn multi_get_key_value<K: AsRef<[u8]> + Send>(
+async fn multi_get_key_value<K: AsRef<[u8]> + Send + Sync>(
     &self, keys: &[K],
 ) -> Result<Vec<Option<KeyValue>>, Error>;
 
-async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send>(
+async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
     &self, keys: &[K], options: &MultiGetOptions,
 ) -> Result<Vec<Option<KeyValue>>, Error>;
 ```
+
+`K` needs `Sync`, and `get` does not. The reason is the borrowed slice:
+
+- `DbReadOps` uses `#[async_trait]`, so each method returns a `Send` future.
+- The future holds `keys: &[K]`, and `&[K]` is `Send` only when `K` is `Sync`.
+- `get` takes its key by value, so `Send` is enough there.
+
+The common key types (`Vec<u8>`, `Bytes`, `&[u8]`, `String`) are all `Sync`, so
+callers do not see the bound. A hand-written signature with a boxed future can
+drop it, but each implementor of the trait then has to write that signature.
 
 The result has one slot per input key, in input order:
 
@@ -279,8 +289,8 @@ With segments, steps 3 and 4 run inside the segment that covers the key.
 The reasons behind the steps:
 
 - The keys are copied into `Bytes` and sorted. The copy lets spawned tasks
-  share the keys, so `K` needs only `Send`, as in `get`. The sort turns N
-  binary searches in a sorted run into one forward pass.
+  share the keys with no borrow of the input slice. The sort turns N binary
+  searches in a sorted run into one forward pass.
 - The plan phase builds no iterators. A `get` builds one iterator per memtable
   and per candidate SST before its first lookup.
 - The plan phase never loads a filter. A `get` reads the filter of an older
