@@ -80,11 +80,10 @@ pub(crate) async fn read_sst_for_keys(
     }
     let handle = &view.sst;
 
-    // Step 1: load the SST index and filters once for the whole batch.
-    // They use `cache_metadata`, like the single-key path, so
-    // `ReadOptions::cache_blocks` controls only data blocks.
-    let index = table_store
-        .read_index(
+    // Step 1: filters first, like the single-key path, so an SST that rules
+    // out every key never reads its index.
+    let filters = table_store
+        .read_filters(
             handle,
             options.cache_metadata,
             options.segment.clone(),
@@ -92,8 +91,14 @@ pub(crate) async fn read_sst_for_keys(
             sst_level,
         )
         .await?;
-    let filters = table_store
-        .read_filters(
+    let survivors = prune_keys(view, keys, &filters, options, db_stats);
+    if survivors.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Step 2: load the index and map each survivor to its block range.
+    let index = table_store
+        .read_index(
             handle,
             options.cache_metadata,
             options.segment.clone(),
@@ -104,11 +109,7 @@ pub(crate) async fn read_sst_for_keys(
     if index.borrow().block_meta().is_empty() {
         return Ok(Vec::new());
     }
-
-    let candidates = plan_candidates(view, keys, &index, &filters, options, db_stats);
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
+    let candidates = map_candidates(&survivors, &index);
 
     let blocks = fetch_candidate_blocks(
         handle,
@@ -130,21 +131,17 @@ pub(crate) async fn read_sst_for_keys(
     .await
 }
 
-/// Step 2: prune keys by visible range and bloom filter, then map each survivor
-/// to the block range that may hold its versions. Uses the same
-/// `partitions_covering_range` the single-key path uses, so a key whose versions
-/// span a block boundary is covered correctly. Filter positives/negatives are
-/// recorded here; false positives are recorded after scanning (see
-/// [`scan_candidates`]).
-fn plan_candidates(
+/// Prune keys by visible range and bloom filter. Filter positives and
+/// negatives are recorded here. False positives are recorded after scanning
+/// (see [`scan_candidates`]).
+fn prune_keys<'a>(
     view: &SsTableView,
-    keys: &[PendingKey],
-    index: &Arc<SsTableIndexOwned>,
+    keys: &'a [PendingKey],
     filters: &[NamedFilter],
     options: &SstIteratorOptions,
     db_stats: Option<&DbStats>,
-) -> Vec<Candidate> {
-    let mut candidates = Vec::with_capacity(keys.len());
+) -> Vec<&'a PendingKey> {
+    let mut survivors = Vec::with_capacity(keys.len());
     for pk in keys {
         // Visible-range projection (segments / clones). For identity views this
         // also prunes keys outside the SST's physical key range. Keys pruned
@@ -169,19 +166,30 @@ fn plan_candidates(
                 stats.sst_filter_point_positives.increment(1);
             }
         }
-
-        let blocks = partitioned_keyspace::partitions_covering_range(
-            &index.borrow(),
-            Included(pk.key.as_ref()),
-            Included(pk.key.as_ref()),
-        );
-        candidates.push(Candidate {
-            idx: pk.idx,
-            key: pk.key.clone(),
-            blocks,
-        });
+        survivors.push(pk);
     }
-    candidates
+    survivors
+}
+
+/// Map each survivor to the block range that may hold its versions. Uses the
+/// same `partitions_covering_range` as the single-key path, so a key whose
+/// versions span a block boundary is covered.
+fn map_candidates(survivors: &[&PendingKey], index: &Arc<SsTableIndexOwned>) -> Vec<Candidate> {
+    survivors
+        .iter()
+        .map(|pk| {
+            let blocks = partitioned_keyspace::partitions_covering_range(
+                &index.borrow(),
+                Included(pk.key.as_ref()),
+                Included(pk.key.as_ref()),
+            );
+            Candidate {
+                idx: pk.idx,
+                key: pk.key.clone(),
+                blocks,
+            }
+        })
+        .collect()
 }
 
 /// Step 3: collect the union of the candidates' block ranges, coalesce them into
@@ -297,6 +305,67 @@ fn coalesce_runs(sorted_blocks: &[usize], gap: usize) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+
+    use crate::block_cache_policy::BlockCachePolicy;
+    use crate::db_state::SsTableId;
+    use crate::format::sst::SsTableFormat;
+    use crate::reader::ReadTrace;
+    use crate::tablestore::TableStoreKind;
+    use crate::test_utils::RecordingObjectStore;
+
+    #[tokio::test]
+    async fn should_skip_index_read_when_filters_reject_every_key() {
+        let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
+        let table_store = Arc::new(TableStore::new(
+            recording.clone(),
+            SsTableFormat::default(),
+            Path::from("/test"),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+        let mut builder = table_store.table_builder();
+        builder.add(RowEntry::new_value(b"bbb", b"v", 1)).await.unwrap();
+        builder.add(RowEntry::new_value(b"ddd", b"v", 1)).await.unwrap();
+        let encoded = builder.build().await.unwrap();
+        let handle = table_store
+            .write_sst(&SsTableId::from(ulid::Ulid::new()), &encoded, None)
+            .await
+            .unwrap();
+        let view = SsTableView::identity(handle);
+        let options = SstIteratorOptions::default();
+        let read_trace = ReadTrace::new(None);
+        let absent = vec![
+            PendingKey {
+                idx: 0,
+                key: Bytes::from_static(b"aaa"),
+            },
+            PendingKey {
+                idx: 1,
+                key: Bytes::from_static(b"ccc"),
+            },
+        ];
+
+        recording.clear();
+        let result = read_sst_for_keys(
+            &view,
+            &absent,
+            &table_store,
+            &options,
+            &read_trace,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_empty());
+        // Only the filter read reaches the object store.
+        assert_eq!(recording.recorded_get_ranges(false).len(), 1);
+    }
 
     #[test]
     fn coalesce_runs_merges_within_gap_and_splits_beyond() {
