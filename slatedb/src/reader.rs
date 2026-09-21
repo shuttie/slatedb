@@ -12,19 +12,20 @@ use crate::merge_operator::{
     instrument_merge_operator, MergeOperatorIterator, MergeOperatorRequiredIterator,
     MergeOperatorType,
 };
-use crate::multi_sst::{read_sst_for_keys, PendingKey};
+use crate::multi_sst::{read_from_cache, read_sst, PendingKey, SstRead};
 use crate::oracle::Oracle;
 use crate::segment_iterator::{build_segment_iter, SegmentScanContext};
 use crate::sorted_run_iterator::SortedRunIterator;
-use crate::sst_iter::{SstIterator, SstIteratorOptions, SstTracingContext};
+use crate::sst_iter::{task_join_error, SstIterator, SstIteratorOptions, SstTracingContext};
 use crate::tablestore::TableStore;
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
-use crate::utils::build_concurrent;
 use crate::{error::SlateDBError, DbIterator};
 
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
 /// Per-SST batched read result for `multi_get`: `(newest-first rank, [(unique
@@ -44,11 +45,6 @@ struct SstReadWork {
     level: SstTraceLevel,
     keys: Arc<Vec<PendingKey>>,
 }
-
-/// Maximum number of SSTs read concurrently during `multi_get`. All trees and
-/// layers fan out into one bounded pool; reads are object-store-I/O bound, so
-/// a generous buffer pays off.
-const MAX_CONCURRENT_SST_READS: usize = 32;
 
 pub(crate) trait DbStateReader {
     fn memtable(&self) -> Arc<KVTable>;
@@ -624,32 +620,51 @@ impl Reader {
         //    newer than anything on disk).
         let work = build_sst_work(db_state.core(), &unique_keys, &resolved);
         if !work.is_empty() {
-            let max_parallel = work.len().clamp(1, MAX_CONCURRENT_SST_READS);
-            let table_store = self.table_store.clone();
-            let opts = sst_options.clone();
-            let stats = self.db_stats.clone();
-            let results = build_concurrent(work, max_parallel, move |item: SstReadWork| {
-                let table_store = table_store.clone();
-                let mut opts = opts.clone();
+            let mut results: Vec<SstBatchResult> = Vec::with_capacity(work.len());
+            // Each SST answers from the cache first, inline. Only the keys that
+            // miss go to a task. A drop of the `JoinSet` aborts its tasks.
+            let requests = Arc::new(Semaphore::new(options.max_fetch_tasks.max(1)));
+            let mut tasks: JoinSet<Result<SstBatchResult, SlateDBError>> = JoinSet::new();
+            for item in work {
+                let mut opts = sst_options.clone();
                 opts.segment = Some(item.segment);
-                let stats = stats.clone();
-                let read_trace = read_trace.clone();
-                async move {
-                    let per_key = read_sst_for_keys(
-                        &item.view,
-                        &item.keys[..],
-                        &table_store,
-                        &opts,
-                        &read_trace,
-                        Some(&item.level),
-                        Some(&stats),
-                    )
-                    .await?;
-                    Ok(Some((item.rank, per_key)))
+                let cached = read_from_cache(
+                    &item.view,
+                    &item.keys[..],
+                    &self.table_store,
+                    &opts,
+                    Some(&self.db_stats),
+                )
+                .await?;
+                results.push((item.rank, cached.found));
+                if cached.misses.is_empty() {
+                    continue;
                 }
-            })
-            .await?;
-            let mut results: Vec<SstBatchResult> = results.into();
+                let read = SstRead {
+                    view: item.view,
+                    keys: cached.misses,
+                    filters: cached.filters,
+                    index: cached.index,
+                    sst_level: Some(item.level),
+                    options: opts,
+                };
+                let sst_read = read_sst(
+                    read,
+                    self.table_store.clone(),
+                    requests.clone(),
+                    options.clone(),
+                    read_trace.clone(),
+                    Some(self.db_stats.clone()),
+                );
+                let rank = item.rank;
+                tasks.spawn(async move { Ok((rank, sst_read.await?)) });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                let result =
+                    joined.map_err(|e| task_join_error(e, "multi_get_sst_read".to_string()))?;
+                results.push(result?);
+            }
+            // Two results of one SST share a rank, and their keys differ.
             results.sort_unstable_by_key(|(rank, _)| *rank);
             for (_rank, per_key) in results {
                 for (u, entries) in per_key {
@@ -1104,7 +1119,10 @@ mod tests {
     use crate::merge_operator::{
         MergeOperator, MergeOperatorError, MERGE_OPERATOR_FLUSH_PATH, MERGE_OPERATOR_READ_PATH,
     };
-    use crate::test_utils::{lookup_merge_operator_operands, RecordedSpan, SpanRecorder};
+    use crate::test_utils::{
+        lookup_merge_operator_operands, GatedObjectStore, RecordedSpan, RecordingObjectStore,
+        SpanRecorder,
+    };
     use crate::types::{RowEntry, ValueDeletable};
     use bytes::Bytes;
     use rstest::rstest;
@@ -1184,7 +1202,10 @@ mod tests {
 
     impl TestDbState {
         async fn new() -> Self {
-            let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            Self::with_object_store(Arc::new(InMemory::new()))
+        }
+
+        fn with_object_store(object_store: Arc<dyn ObjectStore>) -> Self {
             let table_store = Arc::new(TableStore::new(
                 object_store,
                 SsTableFormat::default(),
@@ -1985,6 +2006,33 @@ mod tests {
         Ok(())
     }
 
+    fn multi_get_reader(
+        test_db_state: &TestDbState,
+        last_committed_seq: Option<u64>,
+        merge: bool,
+    ) -> Reader {
+        let recorder = MetricsRecorderHelper::noop();
+        let db_stats = DbStats::new(&recorder);
+        let test_clock = Arc::new(MockSystemClock::new());
+        let mono_clock = Arc::new(MonotonicClock::new(test_clock as Arc<dyn SystemClock>, 0));
+        let oracle = Arc::new(DbReaderOracle::new(
+            last_committed_seq.unwrap_or(u64::MAX),
+            DbStatusManager::new(0),
+        ));
+        let merge_operator = if merge {
+            Some(Arc::new(StringConcatMergeOperator) as Arc<dyn MergeOperator + Send + Sync>)
+        } else {
+            None
+        };
+        Reader::new(
+            test_db_state.table_store.clone(),
+            db_stats,
+            mono_clock,
+            oracle,
+            merge_operator,
+        )
+    }
+
     /// Build a reader over a populated `TestDbState`, run `multi_get` for
     /// `query_keys`, assert it agrees key-by-key with single `get` against the
     /// same snapshot (the differential invariant), and return the batch values.
@@ -1999,27 +2047,7 @@ mod tests {
     ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
         let mut test_db_state = TestDbState::new().await;
         let write_batch = populate_db_state(&mut test_db_state, entries).await?;
-
-        let recorder = MetricsRecorderHelper::noop();
-        let db_stats = DbStats::new(&recorder);
-        let test_clock = Arc::new(MockSystemClock::new());
-        let mono_clock = Arc::new(MonotonicClock::new(test_clock as Arc<dyn SystemClock>, 0));
-        let oracle = Arc::new(DbReaderOracle::new(
-            last_committed_seq.unwrap_or(u64::MAX),
-            DbStatusManager::new(0),
-        ));
-        let merge_operator = if merge {
-            Some(Arc::new(StringConcatMergeOperator) as Arc<dyn MergeOperator + Send + Sync>)
-        } else {
-            None
-        };
-        let reader = Reader::new(
-            test_db_state.table_store.clone(),
-            db_stats,
-            mono_clock,
-            oracle,
-            merge_operator,
-        );
+        let reader = multi_get_reader(&test_db_state, last_committed_seq, merge);
         let read_options = ReadOptions::default().with_dirty(dirty);
 
         let batch: Vec<Bytes> = query_keys
@@ -2061,6 +2089,41 @@ mod tests {
             );
         }
         Ok(multi_vals)
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_drop_aborts_sst_tasks() -> Result<(), SlateDBError> {
+        let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
+        let gated = Arc::new(GatedObjectStore::new(recording.clone()));
+        let mut test_db_state = TestDbState::with_object_store(gated.clone());
+        let entries = vec![
+            TestEntry::value(b"l0_key", b"l0_val", 70).with_location(LayerLocation::L0Sst(0)),
+            TestEntry::value(b"sr_key", b"sr_val", 50).with_location(LayerLocation::SortedRun(0)),
+        ];
+        populate_db_state(&mut test_db_state, entries).await?;
+        let reader = multi_get_reader(&test_db_state, None, false);
+        let gate = &gated.get_opts_gate;
+        gate.close();
+        let before = gate.arrivals();
+
+        let keys = [b"l0_key".as_ref(), b"sr_key".as_ref()];
+        let options = MultiGetOptions::default();
+        let batch = reader.multi_get_with_options(&keys, &options, &test_db_state, None, None);
+        // The first request of each SST task waits at the gate. Then the batch
+        // future drops.
+        tokio::select! {
+            biased;
+            _ = batch => panic!("the batch must wait at the gate"),
+            _ = gate.wait_for_arrivals(before + 2) => {}
+        }
+
+        recording.clear();
+        gate.release();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(recording.recorded_get_ranges(false).is_empty());
+        Ok(())
     }
 
     #[tokio::test]

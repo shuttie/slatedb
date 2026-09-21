@@ -911,6 +911,66 @@ impl TableStore {
         Ok(blocks_read)
     }
 
+    /// Returns the filters of an SST if they are in the cache. Never loads.
+    /// An SST with no filter gives an empty slice, as [`Self::read_filters`] does.
+    pub(crate) async fn cached_filters(
+        &self,
+        handle: &SsTableHandle,
+    ) -> Option<Arc<[NamedFilter]>> {
+        if self.sst_format.filter_policies.is_empty() || handle.info.filter_len == 0 {
+            return Some(Arc::from([]));
+        }
+        let cache = self.cache_for_reads()?;
+        let cache_key: CachedKey = (handle.id, handle.info.filter_offset).into();
+        let entry = cache.get_filter(&cache_key).await.unwrap_or(None)?;
+        if let Some(filters) = entry.filters() {
+            return Some(filters);
+        }
+        let encoded = entry.encoded_filters()?;
+        Some(
+            self.decode_and_refresh_filter(cache, cache_key, &encoded)
+                .await,
+        )
+    }
+
+    /// Returns the index of an SST if it is in the cache. Never loads.
+    pub(crate) async fn cached_index(
+        &self,
+        handle: &SsTableHandle,
+    ) -> Option<Arc<SsTableIndexOwned>> {
+        let cache = self.cache_for_reads()?;
+        let cache_key = (handle.id, handle.info.index_offset).into();
+        let entry = cache.get_index(&cache_key).await.unwrap_or(None)?;
+        entry.sst_index()
+    }
+
+    /// Returns one block of an SST if it is in the cache. Never loads.
+    pub(crate) async fn cached_block(
+        &self,
+        handle: &SsTableHandle,
+        index: &SsTableIndexOwned,
+        block_num: usize,
+    ) -> Option<Arc<Block>> {
+        let cache = self.cache_for_reads()?;
+        let offset = index.borrow().block_meta().get(block_num).offset();
+        let entry = cache
+            .get_block(&(handle.id, offset).into())
+            .await
+            .unwrap_or(None)?;
+        entry.block()
+    }
+
+    /// The byte range of `blocks` in the SST object.
+    pub(crate) fn block_byte_range(
+        &self,
+        handle: &SsTableHandle,
+        index: &SsTableIndexOwned,
+        blocks: Range<usize>,
+    ) -> Range<u64> {
+        self.sst_format
+            .block_range(blocks, &handle.info, &index.borrow())
+    }
+
     #[allow(dead_code)]
     /// Reads one SST block. `segment` is a hint attached to the
     /// [`ObjectStoreCallTag`] for object-store routing.

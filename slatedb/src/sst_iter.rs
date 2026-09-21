@@ -1212,7 +1212,10 @@ impl RowEntryIterator for SstIterator<'_> {
 /// so the iterator reports the cancellation to its caller instead of panicking
 /// the task that is awaiting the fetch.
 fn block_fetch_join_error(join_err: tokio::task::JoinError, sst_id: SsTableId) -> SlateDBError {
-    let task_name = format!("sst_block_fetch[{:?}]", sst_id);
+    task_join_error(join_err, format!("sst_block_fetch[{:?}]", sst_id))
+}
+
+pub(crate) fn task_join_error(join_err: tokio::task::JoinError, task_name: String) -> SlateDBError {
     match join_err.try_into_panic() {
         Ok(panic_err) => {
             error!(

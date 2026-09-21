@@ -380,6 +380,15 @@ pub struct MultiGetOptions {
     pub filter_context: Option<FilterContext>,
     /// See [`ReadOptions::tracing_options`].
     pub tracing_options: Option<TracingOptions>,
+    /// The maximum number of object store requests of one batch in flight.
+    /// The default is 256.
+    pub max_fetch_tasks: usize,
+    /// Two blocks of one SST go into one ranged GET when the gap between them
+    /// is at most this many bytes. With 0, only adjacent blocks merge. The
+    /// default is 64 KiB.
+    pub coalesce_gap_bytes: usize,
+    /// The upper size of one merged ranged GET. The default is 4 MiB.
+    pub max_coalesced_bytes: usize,
 }
 
 impl Default for MultiGetOptions {
@@ -390,6 +399,9 @@ impl Default for MultiGetOptions {
             cache_blocks: true,
             filter_context: None,
             tracing_options: None,
+            max_fetch_tasks: 256,
+            coalesce_gap_bytes: 64 * 1024,
+            max_coalesced_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -427,6 +439,27 @@ impl MultiGetOptions {
     pub fn with_tracing_options(self, tracing_options: Option<TracingOptions>) -> Self {
         Self {
             tracing_options,
+            ..self
+        }
+    }
+
+    pub fn with_max_fetch_tasks(self, max_fetch_tasks: usize) -> Self {
+        Self {
+            max_fetch_tasks,
+            ..self
+        }
+    }
+
+    pub fn with_coalesce_gap_bytes(self, coalesce_gap_bytes: usize) -> Self {
+        Self {
+            coalesce_gap_bytes,
+            ..self
+        }
+    }
+
+    pub fn with_max_coalesced_bytes(self, max_coalesced_bytes: usize) -> Self {
+        Self {
+            max_coalesced_bytes,
             ..self
         }
     }
