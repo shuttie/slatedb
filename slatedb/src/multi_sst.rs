@@ -32,6 +32,7 @@ use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::format::block::Block;
 use crate::iter::IterationOrder;
 use crate::partitioned_keyspace;
+use crate::reader::{ReadTrace, SstTraceLevel};
 use crate::sst_iter::{all_filters_might_match, SstIteratorOptions};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
@@ -70,6 +71,8 @@ pub(crate) async fn read_sst_for_keys(
     keys: &[PendingKey],
     table_store: &Arc<TableStore>,
     options: &SstIteratorOptions,
+    read_trace: &ReadTrace,
+    sst_level: Option<&SstTraceLevel>,
     db_stats: Option<&DbStats>,
 ) -> Result<Vec<(usize, Vec<RowEntry>)>, SlateDBError> {
     if keys.is_empty() {
@@ -81,10 +84,22 @@ pub(crate) async fn read_sst_for_keys(
     // They use `cache_metadata`, like the single-key path, so
     // `ReadOptions::cache_blocks` controls only data blocks.
     let index = table_store
-        .read_index(handle, options.cache_metadata, options.segment.clone())
+        .read_index(
+            handle,
+            options.cache_metadata,
+            options.segment.clone(),
+            read_trace,
+            sst_level,
+        )
         .await?;
     let filters = table_store
-        .read_filters(handle, options.cache_metadata, options.segment.clone())
+        .read_filters(
+            handle,
+            options.cache_metadata,
+            options.segment.clone(),
+            read_trace,
+            sst_level,
+        )
         .await?;
     if index.borrow().block_meta().is_empty() {
         return Ok(Vec::new());

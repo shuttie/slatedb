@@ -835,7 +835,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_db_evict_cached_sst()
 		})
-		if checksum != 13615 {
+		if checksum != 27129 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_evict_cached_sst: UniFFI API checksum mismatch")
 		}
@@ -925,7 +925,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_db_put()
 		})
-		if checksum != 2894 {
+		if checksum != 17079 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_put: UniFFI API checksum mismatch")
 		}
@@ -1042,7 +1042,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbreader_evict_cached_sst()
 		})
-		if checksum != 18747 {
+		if checksum != 58617 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreader_evict_cached_sst: UniFFI API checksum mismatch")
 		}
@@ -3378,7 +3378,8 @@ type DbInterface interface {
 	DeleteWithOptions(key []byte, options WriteOptions) (*WriteHandle, error)
 	// Best-effort eviction of block-cache entries for one SST.
 	//
-	// If no block cache is configured, returns `Ok(())`.
+	// If no block cache is configured, or if the SST is not reachable from
+	// the current manifest, the call is a no-op that returns `Ok(())`.
 	EvictCachedSst(sstId SsTableId) error
 	// Flushes the default storage layer.
 	Flush() error
@@ -3412,7 +3413,7 @@ type DbInterface interface {
 	MergeWithOptions(key []byte, operand []byte, mergeOptions MergeOptions, writeOptions WriteOptions) (*WriteHandle, error)
 	// Inserts or overwrites a value and returns metadata for the write.
 	//
-	// Keys must be non-empty and at most `u16::MAX` bytes. Values must be at
+	// Keys must be non-empty and at most `u32::MAX` bytes. Values must be at
 	// most `u32::MAX` bytes.
 	Put(key []byte, value []byte) (*WriteHandle, error)
 	// Inserts or overwrites a value using custom put and write options.
@@ -3560,7 +3561,8 @@ func (_self *Db) DeleteWithOptions(key []byte, options WriteOptions) (*WriteHand
 
 // Best-effort eviction of block-cache entries for one SST.
 //
-// If no block cache is configured, returns `Ok(())`.
+// If no block cache is configured, or if the SST is not reachable from
+// the current manifest, the call is a no-op that returns `Ok(())`.
 func (_self *Db) EvictCachedSst(sstId SsTableId) error {
 	_pointer := _self.ffiObject.incrementPointer("*Db")
 	defer _self.ffiObject.decrementPointer()
@@ -3914,7 +3916,7 @@ func (_self *Db) MergeWithOptions(key []byte, operand []byte, mergeOptions Merge
 
 // Inserts or overwrites a value and returns metadata for the write.
 //
-// Keys must be non-empty and at most `u16::MAX` bytes. Values must be at
+// Keys must be non-empty and at most `u32::MAX` bytes. Values must be at
 // most `u32::MAX` bytes.
 func (_self *Db) Put(key []byte, value []byte) (*WriteHandle, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Db")
@@ -4965,7 +4967,8 @@ func (_ FfiDestroyerDbIterator) Destroy(value *DbIterator) {
 type DbReaderInterface interface {
 	// Best-effort eviction of block-cache entries for one SST.
 	//
-	// If no block cache is configured, returns `Ok(())`.
+	// If no block cache is configured, or if the SST is not reachable from
+	// the current manifest, the call is a no-op that returns `Ok(())`.
 	EvictCachedSst(sstId SsTableId) error
 	// Sends this reader's cached data to disk.
 	//
@@ -5017,7 +5020,8 @@ type DbReader struct {
 
 // Best-effort eviction of block-cache entries for one SST.
 //
-// If no block cache is configured, returns `Ok(())`.
+// If no block cache is configured, or if the SST is not reachable from
+// the current manifest, the call is a no-op that returns `Ok(())`.
 func (_self *DbReader) EvictCachedSst(sstId SsTableId) error {
 	_pointer := _self.ffiObject.incrementPointer("*DbReader")
 	defer _self.ffiObject.decrementPointer()
@@ -11137,16 +11141,16 @@ func (_ FfiDestroyerSegmentPrefix) Destroy(value SegmentPrefix) {
 
 // Options controlling how the native SlateDB WAL reader fetches WAL SSTs.
 type SlateDbWalReaderOptions struct {
-	// Number of WAL SSTs to preload.
-	SstBatchSize uint64
-	// Number of concurrent fetch tasks per WAL SST.
+	// Shared soft limit on bytes buffered across WAL SSTs.
+	MaxBufferedBytes uint64
+	// Shared limit on concurrent WAL SST fetch tasks.
 	MaxFetchTasks uint64
-	// Number of bytes to read ahead from each WAL SST.
+	// Target number of bytes in each WAL SST fetch.
 	ReadAheadBytes uint64
 }
 
 func (r *SlateDbWalReaderOptions) Destroy() {
-	FfiDestroyerUint64{}.Destroy(r.SstBatchSize)
+	FfiDestroyerUint64{}.Destroy(r.MaxBufferedBytes)
 	FfiDestroyerUint64{}.Destroy(r.MaxFetchTasks)
 	FfiDestroyerUint64{}.Destroy(r.ReadAheadBytes)
 }
@@ -11176,7 +11180,7 @@ func (c FfiConverterSlateDbWalReaderOptions) LowerExternal(value SlateDbWalReade
 }
 
 func (c FfiConverterSlateDbWalReaderOptions) Write(writer io.Writer, value SlateDbWalReaderOptions) {
-	FfiConverterUint64INSTANCE.Write(writer, value.SstBatchSize)
+	FfiConverterUint64INSTANCE.Write(writer, value.MaxBufferedBytes)
 	FfiConverterUint64INSTANCE.Write(writer, value.MaxFetchTasks)
 	FfiConverterUint64INSTANCE.Write(writer, value.ReadAheadBytes)
 }
