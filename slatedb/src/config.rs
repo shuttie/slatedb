@@ -389,6 +389,10 @@ pub struct MultiGetOptions {
     pub coalesce_gap_bytes: usize,
     /// The upper size of one merged ranged GET. The default is 4 MiB.
     pub max_coalesced_bytes: usize,
+    /// How many SSTs with a positive filter a key reads in one wave, after
+    /// wave 1. Wave 1 always reads one. A value of 0 acts as 1. The default
+    /// is 4, the lookahead of `get`.
+    pub lookahead: usize,
 }
 
 impl Default for MultiGetOptions {
@@ -402,6 +406,7 @@ impl Default for MultiGetOptions {
             max_fetch_tasks: 256,
             coalesce_gap_bytes: 64 * 1024,
             max_coalesced_bytes: 4 * 1024 * 1024,
+            lookahead: 4,
         }
     }
 }
@@ -462,6 +467,10 @@ impl MultiGetOptions {
             max_coalesced_bytes,
             ..self
         }
+    }
+
+    pub fn with_lookahead(self, lookahead: usize) -> Self {
+        Self { lookahead, ..self }
     }
 }
 

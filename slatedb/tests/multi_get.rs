@@ -20,7 +20,7 @@ use slatedb::config::{
     SizeTieredCompactionSchedulerOptions, WriteOptions,
 };
 use slatedb::db_cache::foyer::FoyerCache;
-use slatedb::db_stats::{MULTI_GET_KEYS, REQUEST_COUNT};
+use slatedb::db_stats::{MULTI_GET_KEYS, MULTI_GET_WAVES, REQUEST_COUNT};
 use slatedb::instrumented_object_store_stats::REQUEST_COUNT as OBJECT_STORE_REQUEST_COUNT;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
@@ -464,13 +464,15 @@ async fn open_l0_db(
     (db, recorder)
 }
 
-/// Goal 3 of the RFC: a batch sends no more GETs than a `get` loop.
+/// Goal 3 of the RFC: a batch sends no more GETs than a `get` loop, plus one
+/// filter load per SST whose filter is not cached.
 /// No cache is the cold case. With a cache, one read warms it first.
 async fn assert_batch_gets_not_above_loop(path: &str, num_keys: usize, overwrite: bool) {
+    const SSTS: usize = 6;
     let keys: Vec<Vec<u8>> = (0..num_keys).map(key).collect();
     for cached in [false, true] {
         let path = format!("{path}_{cached}");
-        let (db, recorder) = open_l0_db(&path, cached, &keys, 6, overwrite).await;
+        let (db, recorder) = open_l0_db(&path, cached, &keys, SSTS, overwrite).await;
         if cached {
             db.multi_get(&keys).await.unwrap();
         }
@@ -485,8 +487,9 @@ async fn assert_batch_gets_not_above_loop(path: &str, num_keys: usize, overwrite
         }
         let loop_gets = store_gets(&recorder) - start;
 
+        let cold_filters = if cached { 0 } else { SSTS as u64 };
         assert!(
-            batch_gets <= loop_gets,
+            batch_gets <= loop_gets + cold_filters,
             "cached={cached}: batch sent {batch_gets} GETs, loop sent {loop_gets}"
         );
         db.close().await.unwrap();
@@ -499,7 +502,6 @@ async fn test_multi_get_requests_not_above_get_loop_distinct_keys() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "goal 3 holds after MGET_PLAN step 4"]
 async fn test_multi_get_requests_not_above_get_loop_many_versions() {
     // A small batch, so shared reads cannot hide the reads of shadowed versions.
     assert_batch_gets_not_above_loop("/tmp/test_multi_get_requests_versions", 2, true).await;
@@ -514,6 +516,7 @@ async fn test_multi_get_metrics() {
 
     assert_eq!(counter(&recorder, REQUEST_COUNT, &[("op", "multi_get")]), 1);
     assert_eq!(counter(&recorder, MULTI_GET_KEYS, &[]), 3);
+    assert_eq!(counter(&recorder, MULTI_GET_WAVES, &[]), 1);
     assert_eq!(counter(&recorder, REQUEST_COUNT, &[("op", "get")]), 0);
     db.close().await.unwrap();
 }

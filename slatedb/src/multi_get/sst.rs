@@ -41,13 +41,22 @@ use crate::sst_iter::{all_filters_might_match, SstIteratorOptions};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
 
-/// The result of [`read_from_cache`] for one SST.
-pub(crate) struct CacheRead {
-    /// Entries of the keys that the cache answered.
-    pub(crate) found: Vec<(usize, Vec<RowEntry>)>,
-    /// Keys that need [`read_sst`].
+/// The entries that one SST holds for one key of the batch.
+pub(crate) struct KeyEntries {
+    /// The slot of the key, as in [`PendingKey::idx`].
+    pub(crate) idx: usize,
+    /// Newest first, and never empty.
+    pub(crate) entries: Vec<RowEntry>,
+}
+
+/// The result of [`read_from_cache`] or [`read_sst`] for one SST.
+pub(crate) struct SstEntries {
+    /// The keys that the read answered.
+    pub(crate) found: Vec<KeyEntries>,
+    /// Keys that the cache did not answer. They need [`read_sst`], which
+    /// leaves no miss.
     pub(crate) misses: Vec<PendingKey>,
-    /// The cached index, so that [`read_sst`] does not look it up again.
+    /// The index that the read used. The batch keeps it for later reads.
     pub(crate) index: Option<Arc<SsTableIndexOwned>>,
 }
 
@@ -97,9 +106,9 @@ pub(crate) async fn read_from_cache(
     filters_present: bool,
     table_store: &TableStore,
     db_stats: Option<&DbStats>,
-) -> Result<CacheRead, SlateDBError> {
+) -> Result<SstEntries, SlateDBError> {
     let survivors: Vec<&PendingKey> = keys.iter().collect();
-    let mut read = CacheRead {
+    let mut read = SstEntries {
         found: Vec::new(),
         misses: Vec::new(),
         index: table_store.cached_index(handle).await,
@@ -155,7 +164,7 @@ pub(crate) async fn read_from_cache(
 /// Read the keys of one SST from the object store. Each object store request
 /// holds a permit of `requests`, the request semaphore of the batch.
 ///
-/// The output has the same form as [`CacheRead::found`].
+/// The result has no misses.
 pub(crate) async fn read_sst(
     read: SstRead,
     table_store: Arc<TableStore>,
@@ -163,7 +172,7 @@ pub(crate) async fn read_sst(
     batch_options: MultiGetOptions,
     read_trace: ReadTrace,
     db_stats: Option<DbStats>,
-) -> Result<Vec<(usize, Vec<RowEntry>)>, SlateDBError> {
+) -> Result<SstEntries, SlateDBError> {
     let SstRead {
         view,
         keys,
@@ -174,31 +183,35 @@ pub(crate) async fn read_sst(
     } = read;
     let handle = &view.sst;
     let db_stats = db_stats.as_ref();
+    let mut entries = SstEntries {
+        found: Vec::new(),
+        misses: Vec::new(),
+        index,
+    };
 
     // Filters first, like the single-key path, so an SST that rules out every
     // key never reads its index.
     let (filters, survivors) = match filters {
         Some(filters) => (filters, keys.iter().collect()),
         None => {
-            let _permit = request_permit(&requests).await;
-            let filters = table_store
-                .read_filters(
-                    handle,
-                    options.cache_metadata,
-                    options.segment.clone(),
-                    &read_trace,
-                    sst_level.as_ref(),
-                )
-                .await?;
+            let filters = load_filters(
+                &view,
+                &options,
+                sst_level.as_ref(),
+                &table_store,
+                &requests,
+                &read_trace,
+            )
+            .await?;
             let survivors = filter_keys(&keys, &filters, &options.filter_context, db_stats);
             (filters, survivors)
         }
     };
     if survivors.is_empty() {
-        return Ok(Vec::new());
+        return Ok(entries);
     }
 
-    let index = match index {
+    let index = match entries.index.clone() {
         Some(index) => index,
         None => {
             let _permit = request_permit(&requests).await;
@@ -213,8 +226,9 @@ pub(crate) async fn read_sst(
                 .await?
         }
     };
+    entries.index = Some(index.clone());
     if index.borrow().block_meta().is_empty() {
-        return Ok(Vec::new());
+        return Ok(entries);
     }
     let candidates = map_candidates(&survivors, &index);
 
@@ -229,14 +243,37 @@ pub(crate) async fn read_sst(
     )
     .await?;
 
-    scan_candidates(
+    entries.found = scan_candidates(
         handle.format_version,
         &candidates,
         &blocks,
         !filters.is_empty(),
         db_stats,
     )
-    .await
+    .await?;
+    Ok(entries)
+}
+
+/// Load the filters of one SST under a permit of `requests`. With an empty
+/// result, the SST has no filter.
+pub(crate) async fn load_filters(
+    view: &SsTableView,
+    options: &SstIteratorOptions,
+    sst_level: Option<&SstTraceLevel>,
+    table_store: &TableStore,
+    requests: &Semaphore,
+    read_trace: &ReadTrace,
+) -> Result<Arc<[NamedFilter]>, SlateDBError> {
+    let _permit = request_permit(requests).await;
+    table_store
+        .read_filters(
+            &view.sst,
+            options.cache_metadata,
+            options.segment.clone(),
+            read_trace,
+            sst_level,
+        )
+        .await
 }
 
 async fn request_permit(requests: &Semaphore) -> tokio::sync::SemaphorePermit<'_> {
@@ -360,7 +397,7 @@ async fn scan_candidates(
     blocks: &BTreeMap<usize, Arc<Block>>,
     filters_present: bool,
     db_stats: Option<&DbStats>,
-) -> Result<Vec<(usize, Vec<RowEntry>)>, SlateDBError> {
+) -> Result<Vec<KeyEntries>, SlateDBError> {
     let mut out = Vec::with_capacity(candidates.len());
     for cand in candidates {
         let entries = scan_candidate_key(sst_version, cand, blocks).await?;
@@ -371,7 +408,10 @@ async fn scan_candidates(
                 }
             }
         } else {
-            out.push((cand.idx, entries));
+            out.push(KeyEntries {
+                idx: cand.idx,
+                entries,
+            });
         }
     }
     Ok(out)
@@ -548,11 +588,7 @@ mod tests {
             }
         }
 
-        async fn read_sst(
-            &self,
-            read: SstRead,
-            batch_options: MultiGetOptions,
-        ) -> Vec<(usize, Vec<RowEntry>)> {
+        async fn read_sst(&self, read: SstRead, batch_options: MultiGetOptions) -> Vec<KeyEntries> {
             let requests = Arc::new(Semaphore::new(batch_options.max_fetch_tasks));
             read_sst(
                 read,
@@ -564,9 +600,10 @@ mod tests {
             )
             .await
             .unwrap()
+            .found
         }
 
-        async fn read_from_cache(&self, keys: &[usize]) -> CacheRead {
+        async fn read_from_cache(&self, keys: &[usize]) -> SstEntries {
             read_from_cache(
                 &self.view.sst,
                 &pending(keys),
@@ -605,8 +642,8 @@ mod tests {
         }
     }
 
-    fn found_keys(found: &[(usize, Vec<RowEntry>)]) -> Vec<usize> {
-        let mut keys: Vec<usize> = found.iter().map(|(idx, _)| *idx).collect();
+    fn found_keys(found: &[KeyEntries]) -> Vec<usize> {
+        let mut keys: Vec<usize> = found.iter().map(|key| key.idx).collect();
         keys.sort_unstable();
         keys
     }

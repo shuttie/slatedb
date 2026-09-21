@@ -12,6 +12,7 @@ use crate::bytes_range::BytesRange;
 use crate::db_state::{SortedRun, SsTableView};
 use crate::db_stats::DbStats;
 use crate::filter_policy::{FilterContext, NamedFilter};
+use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::manifest::{ManifestCore, Segment};
 use crate::reader::SstTraceLevel;
 
@@ -60,8 +61,11 @@ pub(crate) struct PlanSst {
     pub(crate) view: SsTableView,
     pub(crate) segment: Bytes,
     pub(crate) level: SstTraceLevel,
-    /// The filters from the cache. `None` means that they are not cached.
+    /// The filters from the cache, or from the first load of the batch.
+    /// `None` means that the batch does not have them yet.
     pub(crate) filters: Option<Arc<[NamedFilter]>>,
+    /// The index, after the first read of the batch that used it.
+    pub(crate) index: Option<Arc<SsTableIndexOwned>>,
     /// Sorted. `idx` points into [`BatchKeys::keys`].
     pub(crate) keys: Vec<PendingKey>,
 }
@@ -70,8 +74,6 @@ pub(crate) struct PlanSst {
 pub(crate) struct Candidate {
     /// Index into [`Plan::ssts`].
     pub(crate) sst: usize,
-    // Step 4 (`pick_next`) reads the state.
-    #[allow(dead_code)]
     pub(crate) state: FilterState,
 }
 
@@ -118,6 +120,69 @@ impl Plan {
         }
         plan
     }
+
+    /// Apply the filters that a wave loaded for the UNKNOWN SST `sst`. An open
+    /// key that they reject loses this candidate. The other open keys become
+    /// POSITIVE.
+    pub(crate) fn apply_filters(
+        &mut self,
+        sst: usize,
+        filters: Arc<[NamedFilter]>,
+        resolved: &[bool],
+        filter_context: &Option<FilterContext>,
+        db_stats: Option<&DbStats>,
+    ) {
+        let open: Vec<PendingKey> = self.ssts[sst]
+            .keys
+            .iter()
+            .filter(|pk| !resolved[pk.idx])
+            .cloned()
+            .collect();
+        // Sorted, as `open` is.
+        let kept: Vec<usize> = filter_keys(&open, &filters, filter_context, db_stats)
+            .iter()
+            .map(|pk| pk.idx)
+            .collect();
+        for pk in &open {
+            let candidates = &mut self.candidates[pk.idx];
+            if kept.binary_search(&pk.idx).is_err() {
+                candidates.retain(|c| c.sst != sst);
+                continue;
+            }
+            for candidate in candidates.iter_mut().filter(|c| c.sst == sst) {
+                candidate.state = FilterState::Positive;
+            }
+        }
+        self.ssts[sst].filters = Some(filters);
+    }
+}
+
+/// How many candidates of one key, newest first, a wave reads. The walk stops
+/// after `limit` POSITIVE SSTs. An UNKNOWN SST is free, because the wave only
+/// loads its filter. A limit of 0 acts as 1.
+fn pick(candidates: &[Candidate], limit: usize) -> usize {
+    let mut left = limit.max(1);
+    for (i, candidate) in candidates.iter().enumerate() {
+        if candidate.state == FilterState::Positive {
+            left -= 1;
+            if left == 0 {
+                return i + 1;
+            }
+        }
+    }
+    candidates.len()
+}
+
+/// The pick of wave 1: down to the first POSITIVE SST. A key with a merge
+/// operand needs its base value, so it has no limit.
+pub(crate) fn pick_first(candidates: &[Candidate], has_operand: bool) -> usize {
+    pick(candidates, if has_operand { usize::MAX } else { 1 })
+}
+
+/// The pick of each later wave: `lookahead` POSITIVE SSTs, as `get` does
+/// after its first miss.
+pub(crate) fn pick_next(candidates: &[Candidate], has_operand: bool, lookahead: usize) -> usize {
+    pick(candidates, if has_operand { usize::MAX } else { lookahead })
 }
 
 /// The SSTs that can hold the open keys, newest first inside each LSM tree.
@@ -137,6 +202,7 @@ pub(crate) fn candidate_ssts(
                     segment: segment.prefix.clone(),
                     level,
                     filters: None,
+                    index: None,
                     keys,
                 });
             }
@@ -265,8 +331,7 @@ mod tests {
     }
 
     fn sorted_keys(keys: &[&str]) -> Vec<Bytes> {
-        let keys = BatchKeys::new(keys).keys;
-        keys
+        BatchKeys::new(keys).keys
     }
 
     fn pending(keys: &[Bytes]) -> Vec<PendingKey> {
@@ -457,50 +522,116 @@ mod tests {
         let keys = sorted_keys(&["a", "b", "c"]);
         let ssts: Vec<PlanSst> = ssts
             .iter()
-            .map(|(filter_keys, sst_keys)| PlanSst {
-                view: view(&("a", "z")),
-                segment: Bytes::new(),
-                level: SstTraceLevel::L0,
-                filters: filter_keys.as_deref().map(filters_of),
-                keys: pending(&keys)
-                    .into_iter()
-                    .filter(|pk| sst_keys.contains(&pk.idx))
-                    .collect(),
+            .map(|(filter_keys, sst_keys)| {
+                let filters = filter_keys.as_deref().map(filters_of);
+                plan_sst(filters, &keys, sst_keys)
             })
             .collect();
 
         let plan = Plan::new(ssts, keys.len(), &None, None);
 
         assert_eq!(plan.ssts.len(), expected_ssts);
-        let expected: Vec<Vec<Candidate>> = expected
-            .iter()
-            .map(|candidates| {
-                let candidates = candidates.iter();
-                candidates
-                    .map(|&(sst, state)| Candidate { sst, state })
-                    .collect()
-            })
-            .collect();
+        let expected: Vec<Vec<Candidate>> = expected.iter().map(|c| candidates(c)).collect();
         assert_eq!(plan.candidates, expected);
     }
 
     #[test]
     fn should_treat_an_sst_with_no_filter_as_positive() {
         let keys = sorted_keys(&["a"]);
-        let sst = PlanSst {
-            view: view(&("a", "z")),
-            segment: Bytes::new(),
-            level: SstTraceLevel::L0,
-            filters: Some(Arc::from(Vec::new())),
-            keys: pending(&keys),
-        };
+        let sst = plan_sst(Some(Arc::from(Vec::new())), &keys, &[0]);
 
         let plan = Plan::new(vec![sst], 1, &None, None);
 
-        let expected = Candidate {
-            sst: 0,
-            state: Positive,
+        assert_eq!(plan.candidates, [candidates(&[(0, Positive)])]);
+    }
+
+    #[rstest]
+    #[case::pass_becomes_positive(vec!["a", "b"], [false, false], vec![(1, Positive)], vec![(1, Positive)])]
+    #[case::reject_removes_the_candidate(vec!["b"], [false, false], vec![], vec![(1, Positive)])]
+    // Key `a` is resolved, so the filters do not probe it.
+    #[case::resolved_key_is_skipped(vec!["b"], [true, false], vec![(1, Unknown)], vec![(1, Positive)])]
+    fn should_apply_loaded_filters(
+        #[case] filter_keys: Vec<&str>,
+        #[case] resolved: [bool; 2],
+        #[case] expected_a: Vec<(usize, FilterState)>,
+        #[case] expected_b: Vec<(usize, FilterState)>,
+    ) {
+        let keys = sorted_keys(&["a", "b"]);
+        // SST 0 holds only `b` and stays UNKNOWN. SST 1 gets the filters.
+        let ssts = vec![plan_sst(None, &keys, &[1]), plan_sst(None, &keys, &[0, 1])];
+        let mut plan = Plan::new(ssts, keys.len(), &None, None);
+
+        plan.apply_filters(1, filters_of(&filter_keys), &resolved, &None, None);
+
+        assert!(plan.ssts[1].filters.is_some());
+        assert_eq!(plan.candidates[0], candidates(&expected_a));
+        let mut expected = candidates(&[(0, Unknown)]);
+        expected.extend(candidates(&expected_b));
+        assert_eq!(plan.candidates[1], expected);
+    }
+
+    const U: (usize, FilterState) = (0, Unknown);
+    const P: (usize, FilterState) = (0, Positive);
+
+    #[rstest]
+    #[case::empty(&[], 1, 0)]
+    #[case::stops_at_the_first_positive(&[P, P, P], 1, 1)]
+    #[case::unknown_is_free(&[U, U, P, P], 1, 3)]
+    #[case::all_unknown_picks_all(&[U, U, U], 1, 3)]
+    #[case::limit_counts_positives(&[P, U, P, U, P], 2, 3)]
+    #[case::limit_above_the_list(&[P, U], 4, 2)]
+    #[case::zero_acts_as_one(&[P, P], 0, 1)]
+    fn should_pick_up_to_the_limit(
+        #[case] list: &[(usize, FilterState)],
+        #[case] limit: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(pick(&candidates(list), limit), expected);
+    }
+
+    #[rstest]
+    #[case::first_wave_reads_one(true, false, 4, 1)]
+    #[case::first_wave_with_operand_reads_all(true, true, 4, 6)]
+    #[case::later_wave_reads_lookahead(false, false, 4, 4)]
+    #[case::later_wave_with_lookahead_1(false, false, 1, 1)]
+    #[case::later_wave_with_lookahead_0(false, false, 0, 1)]
+    #[case::later_wave_with_operand_reads_all(false, true, 1, 6)]
+    fn should_limit_each_wave(
+        #[case] first_wave: bool,
+        #[case] has_operand: bool,
+        #[case] lookahead: usize,
+        #[case] expected: usize,
+    ) {
+        let list = candidates(&[P; 6]);
+        let picked = match first_wave {
+            true => pick_first(&list, has_operand),
+            false => pick_next(&list, has_operand, lookahead),
         };
-        assert_eq!(plan.candidates, [vec![expected]]);
+        assert_eq!(picked, expected);
+    }
+
+    /// An SST over all keys of the range `a..z`, with the keys `sst_keys`.
+    fn plan_sst(
+        filters: Option<Arc<[NamedFilter]>>,
+        keys: &[Bytes],
+        sst_keys: &[usize],
+    ) -> PlanSst {
+        PlanSst {
+            view: view(&("a", "z")),
+            segment: Bytes::new(),
+            level: SstTraceLevel::L0,
+            filters,
+            index: None,
+            keys: pending(keys)
+                .into_iter()
+                .filter(|pk| sst_keys.contains(&pk.idx))
+                .collect(),
+        }
+    }
+
+    fn candidates(list: &[(usize, FilterState)]) -> Vec<Candidate> {
+        list.iter()
+            .map(|&(sst, state)| Candidate { sst, state })
+            .collect()
     }
 }

@@ -73,7 +73,8 @@ impl ReadTrace {
         }
     }
 
-    /// Same as [`Self::new`], with the batch size on the read span.
+    /// Same as [`Self::new`], with the batch size on the read span. The batch
+    /// records `waves` when it ends.
     pub(crate) fn new_multi_get(tracing_options: Option<TracingOptions>, keys: usize) -> Self {
         let read_span = tracing_options
             .as_ref()
@@ -82,6 +83,7 @@ impl ReadTrace {
                     "slatedb.read",
                     trace_id = tracing_options.trace_id.as_str(),
                     keys,
+                    waves = tracing::field::Empty,
                 )
             })
             .unwrap_or_else(tracing::Span::none);
@@ -1739,6 +1741,62 @@ mod tests {
 
         assert_eq!(values, [None, None]);
         assert!(recording.recorded_get_ranges(false).is_empty());
+        Ok(())
+    }
+
+    fn l0_value(value: &'static [u8], seq: u64, sst: usize) -> TestEntry {
+        TestEntry::value(b"k", value, seq).with_location(LayerLocation::L0Sst(sst))
+    }
+
+    fn l0_merge(value: &'static [u8], seq: u64, sst: usize) -> TestEntry {
+        TestEntry::merge(b"k", value, seq).with_location(LayerLocation::L0Sst(sst))
+    }
+
+    /// One batch for the key `k` over a store with no cache. A filter, an
+    /// index, and a block cost one GET each.
+    #[rstest]
+    // The filters of all 3 SSTs load, and only the newest SST is read.
+    #[case::shadowed_versions_are_not_read(
+        vec![l0_value(b"v0", 50, 0), l0_value(b"v1", 60, 1), l0_value(b"v2", 70, 2)],
+        None, b"v2", 1, 3 + 2,
+    )]
+    // `max_seq` hides the version of wave 1, so wave 2 reads one more SST.
+    #[case::hidden_version_costs_a_wave(
+        vec![l0_value(b"v0", 50, 0), l0_value(b"v1", 60, 1), l0_value(b"v2", 70, 2)],
+        Some(65), b"v1", 2, 3 + 2 + 2,
+    )]
+    // Wave 1 finds a merge operand. It removes the limit, so wave 2 reads
+    // both older SSTs, and there is no wave 3.
+    #[case::operand_removes_the_limit(
+        vec![l0_value(b"v0", 50, 0), l0_merge(b"+1", 60, 1), l0_merge(b"+2", 70, 2)],
+        None, b"v0+1+2", 2, 3 + 2 + 2 * 2,
+    )]
+    #[tokio::test]
+    async fn test_multi_get_waves(
+        #[case] entries: Vec<TestEntry>,
+        #[case] max_seq: Option<u64>,
+        #[case] expected: &'static [u8],
+        #[case] expected_waves: i64,
+        #[case] expected_gets: usize,
+    ) -> Result<(), SlateDBError> {
+        let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
+        let mut test_db_state = TestDbState::with_object_store(recording.clone());
+        populate_db_state(&mut test_db_state, entries).await?;
+        recording.clear();
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        let reader = build_reader(&test_db_state, DbStats::new(&helper), true).await;
+
+        let options = MultiGetOptions::default().with_lookahead(1);
+        let values = reader
+            .multi_get_with_options(&[b"k"], &options, &test_db_state, None, max_seq)
+            .await?;
+
+        let value = values[0].as_ref().and_then(|entry| entry.value.as_bytes());
+        assert_eq!(value, Some(Bytes::from_static(expected)));
+        let waves = lookup_metric_with_labels(&recorder, crate::db_stats::MULTI_GET_WAVES, &[]);
+        assert_eq!(waves, Some(expected_waves));
+        assert_eq!(recording.recorded_get_ranges(false).len(), expected_gets);
         Ok(())
     }
 

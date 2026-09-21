@@ -120,7 +120,7 @@ to repeat this work for each key:
 
 - Return the same resuls as a `get` for each key, with all keys reading from one state view.
 - Share the work that a `get` in a loop repeats. Do the setup once per batch.
-- Never cost more than the loop. A batch read sends no more object store requests than a `get` loop.
+- Never cost more than the loop. A batch read sends no more object store requests than a `get` loop, plus at most one filter load per SST whose filter is not in the cache.
 - Bound the concurrency and memory of one batch.
 
 ## Non-Goals
@@ -309,9 +309,14 @@ loaded = {}                               # filters and indexes of this batch
 
 while open_keys is not empty:             # one iteration = one wave
     # 1. Pick: each key takes its next SSTs (see the rules below)
+    unknown = UNKNOWN SSTs inside pick_next(candidates[key]) of each open key
+    for sst in unknown, all in parallel:
+        filter = load_filter(sst)         # kept in loaded
+        for key in open keys of sst:
+            mark (key, sst) as POSITIVE, or remove sst from candidates[key]
     for key in open_keys:
         picked = pick_next(candidates[key])   # removes them from the list
-        for sst in picked:
+        for sst in picked:                # no UNKNOWN is left in picked
             wave[sst].push(key)           # group the keys per SST
 
     # 2. Read: one unit of work per SST, all of them in parallel
@@ -336,9 +341,6 @@ while open_keys is not empty:             # one iteration = one wave
 
 
 read_sst(sst, keys):                      # runs as a spawned task
-    if sst is UNKNOWN for these keys:
-        filter = load_filter(sst)         # kept in loaded
-        keys = keys where filter.might_match(key)
     index  = load_index(sst)              # kept in loaded
     blocks = the block of each key, from the index
     ranges = merge_adjacent(blocks)       # coalesce_gap_bytes
@@ -386,8 +388,11 @@ candidates of K, newest first:   A          B          C
 filter state from the plan:      UNKNOWN    POSITIVE   POSITIVE
 
 wave 1 picks A and B, and stops at the first POSITIVE:
-    A: load the filter -> negative, no block to read
+    A: load the filter -> negative, A leaves the list
     B: read one block  -> K is there, done
+
+if the filter of A is positive, A is the first POSITIVE:
+    A: read one block, and B waits for wave 2
 
 wave 2 runs only if B was a false positive:
     C: read one block
@@ -404,6 +409,10 @@ The reasons:
   of 100. The common case is a new L0 SST that a `DbReader` has never seen.
   This SST is the newest candidate of each key of the batch. If it counted,
   wave 1 only loaded one filter, and each new L0 SST cost one more round trip.
+  Only the filter load is free. The wave loads the filters of its UNKNOWN
+  SSTs first, and an SST that passes counts as POSITIVE. So a cold batch
+  reads no block of a shadowed version. The price is at most one filter load
+  per uncached SST above the requests of a `get` loop.
 - Exception 2: a merge operand removes the limit. The key needs its base
   value, so it must read each SST down to the base in any case. A counter
   with operands in 10 SSTs takes 2 waves and not 4.
@@ -442,8 +451,9 @@ store.
 
 `read_sst`, the I/O path:
 
-- One task per SST does the whole chain for its keys: filter, index, block
-  reads, and seeks.
+- One task per SST does the whole chain for its keys: index, block reads, and
+  seeks. The filter is there before the task starts, from the cache or from
+  the filter load of the wave.
 - The tasks run in parallel on the runtime. The decode work of a large batch
   does not pile up on the task of the caller.
 - Two keys in one block cause one read. The task reuses

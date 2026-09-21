@@ -16,6 +16,7 @@ macro_rules! db_stat_name {
 
 pub const REQUEST_COUNT: &str = db_stat_name!("request_count");
 pub const MULTI_GET_KEYS: &str = db_stat_name!("multi_get_keys");
+pub const MULTI_GET_WAVES: &str = db_stat_name!("multi_get_waves");
 pub const WRITE_OPS: &str = db_stat_name!("write_ops");
 pub const WRITE_BATCH_COUNT: &str = db_stat_name!("write_batch_count");
 pub const BACKPRESSURE_COUNT: &str = db_stat_name!("backpressure_count");
@@ -67,6 +68,7 @@ pub(crate) struct DbStatsInner {
     pub(crate) scan_requests: Arc<dyn CounterFn>,
     pub(crate) multi_get_requests: Arc<dyn CounterFn>,
     pub(crate) multi_get_keys: Arc<dyn CounterFn>,
+    pub(crate) multi_get_waves: Arc<dyn CounterFn>,
     pub(crate) flush_requests: Arc<dyn CounterFn>,
     pub(crate) write_batch_count: Arc<dyn CounterFn>,
     pub(crate) write_ops: Arc<dyn CounterFn>,
@@ -159,6 +161,7 @@ impl DbStats {
                 .labels(&[("op", "multi_get")])
                 .register(),
             multi_get_keys: recorder.counter(MULTI_GET_KEYS).register(),
+            multi_get_waves: recorder.counter(MULTI_GET_WAVES).register(),
             flush_requests: recorder
                 .counter(REQUEST_COUNT)
                 .labels(&[("op", "flush")])
