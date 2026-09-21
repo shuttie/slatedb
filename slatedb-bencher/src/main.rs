@@ -3,11 +3,11 @@
 use crate::args::BencherArgs;
 use args::{
     BencherCommands, BenchmarkCompactionArgs, BenchmarkDbArgs, BenchmarkTransactionArgs,
-    CompactionSubcommands, KeyGeneratorSupplier,
+    CompactionSubcommands, DbMode, KeyGeneratorSupplier,
 };
 use bytes::Bytes;
 use clap::Parser;
-use db::DbBench;
+use db::{log_manifest_shape, wait_for_compaction, DbBench, ReadMode};
 use futures::StreamExt;
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -20,6 +20,7 @@ use slatedb::admin;
 use slatedb::compaction_execute_bench::CompactionExecuteBench;
 use slatedb::config::WriteOptions;
 use slatedb::Db;
+use slatedb_common::metrics::DefaultMetricsRecorder;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
@@ -85,14 +86,30 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
         config.compactor_options = None;
     }
     let write_options = WriteOptions::default();
+    let store = args.db_args.wrap_store(object_store);
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
 
-    let mut builder = Db::builder(path.clone(), object_store.clone()).with_settings(config);
+    let mut builder = Db::builder(path.clone(), store.clone())
+        .with_settings(config)
+        .with_metrics_recorder(recorder.clone());
 
     if let Some(memory_cache) = memory_cache {
         builder = builder.with_db_cache(memory_cache, 0);
     }
 
     let db = Arc::new(builder.build().await.unwrap());
+    log_manifest_shape(&db);
+    let read_mode = match &args.mode {
+        None => ReadMode::Get,
+        Some(DbMode::Mget(mget)) => {
+            info!(reader = %mget.reader, batch_size = mget.batch_size, "using batch reads");
+            ReadMode::Mget {
+                reader: mget.reader,
+                batch_size: mget.batch_size,
+                options: mget.mget_options(),
+            }
+        }
+    };
     let bencher = DbBench::new(
         args.key_gen_supplier(),
         args.val_len,
@@ -103,10 +120,16 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
         args.duration.map(|d| Duration::from_secs(d as u64)),
         args.put_percentage,
         args.get_hit_percentage,
+        read_mode,
         db.clone(),
+        store,
+        recorder,
     );
     bencher.run().await;
 
+    if args.wait_compaction {
+        wait_for_compaction(&db, Duration::from_secs(30 * 60)).await;
+    }
     db.close().await.expect("failed to close db");
 }
 
@@ -156,8 +179,9 @@ async fn exec_benchmark_transaction(
 ) {
     let (config, memory_cache) = args.db_args.config().unwrap();
     let write_options = WriteOptions::default();
+    let store = args.db_args.wrap_store(object_store);
 
-    let mut builder = Db::builder(path.clone(), object_store.clone()).with_settings(config);
+    let mut builder = Db::builder(path.clone(), store).with_settings(config);
 
     if let Some(memory_cache) = memory_cache {
         builder = builder.with_db_cache(memory_cache, 0);

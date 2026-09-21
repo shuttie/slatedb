@@ -324,7 +324,7 @@ impl MgetArgs {
 
 /// How the `mget` mode reads one batch of keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum Reader {
+pub enum Reader {
     /// One `get` after the other.
     Seq,
     /// Up to `read_concurrency` gets at once.
