@@ -365,6 +365,73 @@ impl ReadOptions {
         }
     }
 }
+
+/// Configuration for `multi_get` calls. The fields have the same meaning as in
+/// [`ReadOptions`] and apply to the whole batch.
+#[derive(Clone, Debug)]
+pub struct MultiGetOptions {
+    /// See [`ReadOptions::durability_filter`].
+    pub durability_filter: DurabilityLevel,
+    /// See [`ReadOptions::dirty`].
+    pub dirty: bool,
+    /// See [`ReadOptions::cache_blocks`].
+    pub cache_blocks: bool,
+    /// See [`ReadOptions::filter_context`].
+    pub filter_context: Option<FilterContext>,
+    /// See [`ReadOptions::tracing_options`].
+    pub tracing_options: Option<TracingOptions>,
+}
+
+impl Default for MultiGetOptions {
+    fn default() -> Self {
+        Self {
+            durability_filter: DurabilityLevel::default(),
+            dirty: false,
+            cache_blocks: true,
+            filter_context: None,
+            tracing_options: None,
+        }
+    }
+}
+
+impl MultiGetOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_dirty(self, dirty: bool) -> Self {
+        Self { dirty, ..self }
+    }
+
+    pub fn with_durability_filter(self, durability_filter: DurabilityLevel) -> Self {
+        Self {
+            durability_filter,
+            ..self
+        }
+    }
+
+    pub fn with_cache_blocks(self, cache_blocks: bool) -> Self {
+        Self {
+            cache_blocks,
+            ..self
+        }
+    }
+
+    pub fn with_filter_context(self, filter_context: Option<FilterContext>) -> Self {
+        Self {
+            filter_context,
+            ..self
+        }
+    }
+
+    pub fn with_tracing_options(self, tracing_options: Option<TracingOptions>) -> Self {
+        Self {
+            tracing_options,
+            ..self
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanOptions {
     /// Specifies the minimum durability level for data returned by this scan. For example,

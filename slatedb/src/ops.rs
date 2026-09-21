@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::batch::WriteBatch;
 use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::config::{
-    FlushOptions, MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions,
+    FlushOptions, MergeOptions, MultiGetOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions,
 };
 use crate::db::WriteHandle;
 use crate::db_cache::CacheTarget;
@@ -137,7 +137,7 @@ pub trait DbReadOps {
         &self,
         keys: &[K],
     ) -> Result<Vec<Option<Bytes>>, crate::Error> {
-        self.multi_get_with_options(keys, &ReadOptions::default())
+        self.multi_get_with_options(keys, &MultiGetOptions::default())
             .await
     }
 
@@ -150,7 +150,7 @@ pub trait DbReadOps {
     async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<Bytes>>, crate::Error>;
 
     /// Get multiple key-value pairs in a single snapshot-consistent batch, using
@@ -160,7 +160,7 @@ pub trait DbReadOps {
         &self,
         keys: &[K],
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
-        self.multi_get_key_value_with_options(keys, &ReadOptions::default())
+        self.multi_get_key_value_with_options(keys, &MultiGetOptions::default())
             .await
     }
 
@@ -170,7 +170,7 @@ pub trait DbReadOps {
     async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<KeyValue>>, crate::Error>;
 
     /// Scan a range of keys using the default scan options.

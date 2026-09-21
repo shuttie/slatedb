@@ -48,8 +48,8 @@ use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{
-    CloseOptions, FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions,
-    Settings, WriteOptions,
+    CloseOptions, FlushOptions, FlushType, MergeOptions, MultiGetOptions, PutOptions, ReadOptions,
+    ScanOptions, Settings, WriteOptions,
 };
 use crate::db_common::extract_segment_prefix;
 use crate::db_iter::{DbIterator, DbRecencyIterator};
@@ -233,7 +233,7 @@ impl DbInner {
     pub(crate) async fn multi_get_with_options<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
         let entries = self.multi_get_entries_with_options(keys, options).await?;
         Ok(entries_to_values(entries))
@@ -242,7 +242,7 @@ impl DbInner {
     pub(crate) async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
         let entries = self.multi_get_entries_with_options(keys, options).await?;
         Ok(entries_to_key_values(entries))
@@ -251,7 +251,7 @@ impl DbInner {
     async fn multi_get_entries_with_options<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<RowEntry>>, SlateDBError> {
         self.check_closed()?;
         let db_state = self.state.read().view();
@@ -966,7 +966,7 @@ impl Db {
         &self,
         keys: &[K],
     ) -> Result<Vec<Option<Bytes>>, crate::Error> {
-        self.multi_get_with_options(keys, &ReadOptions::default())
+        self.multi_get_with_options(keys, &MultiGetOptions::default())
             .await
     }
 
@@ -975,7 +975,7 @@ impl Db {
     pub async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<Bytes>>, crate::Error> {
         self.inner
             .multi_get_with_options(keys, options)
@@ -989,7 +989,7 @@ impl Db {
         &self,
         keys: &[K],
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
-        self.multi_get_key_value_with_options(keys, &ReadOptions::default())
+        self.multi_get_key_value_with_options(keys, &MultiGetOptions::default())
             .await
     }
 
@@ -998,7 +998,7 @@ impl Db {
     pub async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
         self.inner
             .multi_get_key_value_with_options(keys, options)
@@ -2003,7 +2003,7 @@ impl DbReadOps for Db {
     async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<Bytes>>, crate::Error> {
         Db::multi_get_with_options(self, keys, options).await
     }
@@ -2011,7 +2011,7 @@ impl DbReadOps for Db {
     async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
         Db::multi_get_key_value_with_options(self, keys, options).await
     }

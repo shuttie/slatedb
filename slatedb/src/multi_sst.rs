@@ -328,8 +328,14 @@ mod tests {
             BlockCachePolicy::default(),
         ));
         let mut builder = table_store.table_builder();
-        builder.add(RowEntry::new_value(b"bbb", b"v", 1)).await.unwrap();
-        builder.add(RowEntry::new_value(b"ddd", b"v", 1)).await.unwrap();
+        builder
+            .add(RowEntry::new_value(b"bbb", b"v", 1))
+            .await
+            .unwrap();
+        builder
+            .add(RowEntry::new_value(b"ddd", b"v", 1))
+            .await
+            .unwrap();
         let encoded = builder.build().await.unwrap();
         let handle = table_store
             .write_sst(&SsTableId::from(ulid::Ulid::new()), &encoded, None)

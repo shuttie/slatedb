@@ -3,7 +3,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::bytes_range::{ByteRangeBounds, BytesRange};
-use crate::config::{ReadOptions, ScanOptions};
+use crate::config::{MultiGetOptions, ReadOptions, ScanOptions};
 use crate::db_iter::DbIterator;
 use crate::types::{KeyValue, RowEntry};
 
@@ -94,7 +94,7 @@ impl DbSnapshot {
         &self,
         keys: &[K],
     ) -> Result<Vec<Option<Bytes>>, crate::Error> {
-        self.multi_get_with_options(keys, &ReadOptions::default())
+        self.multi_get_with_options(keys, &MultiGetOptions::default())
             .await
     }
 
@@ -103,7 +103,7 @@ impl DbSnapshot {
     pub async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<Bytes>>, crate::Error> {
         let entries = self.multi_get_entries_with_options(keys, options).await?;
         Ok(entries_to_values(entries))
@@ -114,7 +114,7 @@ impl DbSnapshot {
         &self,
         keys: &[K],
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
-        self.multi_get_key_value_with_options(keys, &ReadOptions::default())
+        self.multi_get_key_value_with_options(keys, &MultiGetOptions::default())
             .await
     }
 
@@ -123,7 +123,7 @@ impl DbSnapshot {
     pub async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
         let entries = self.multi_get_entries_with_options(keys, options).await?;
         Ok(entries_to_key_values(entries))
@@ -132,7 +132,7 @@ impl DbSnapshot {
     async fn multi_get_entries_with_options<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<RowEntry>>, crate::Error> {
         self.db_inner.check_closed()?;
         let db_state = self.db_inner.state.read().view();
@@ -280,7 +280,7 @@ impl DbReadOps for DbSnapshot {
     async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<Bytes>>, crate::Error> {
         DbSnapshot::multi_get_with_options(self, keys, options).await
     }
@@ -288,7 +288,7 @@ impl DbReadOps for DbSnapshot {
     async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
     ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
         DbSnapshot::multi_get_key_value_with_options(self, keys, options).await
     }

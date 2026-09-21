@@ -4,20 +4,31 @@
 //!
 //! The core gate is the differential property: `multi_get(keys)` must equal
 //! `[get(k) for k in keys]` against the same database. We assert this over
-//! randomized, layered data (many L0 SSTs from repeated flushes), with and
-//! without a block cache and a merge operator, plus transaction and reader
-//! variants.
+//! randomized, layered data (many L0 SSTs and a compacted sorted run), with
+//! and without a block cache and a merge operator, plus transaction and reader
+//! variants. The request count tests check that a batch sends no more object
+//! store GETs than a `get` loop.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use slatedb::bytes::Bytes;
-use slatedb::config::{PutOptions, Settings, WriteOptions};
+use slatedb::config::{
+    CompactionWorkerOptions, CompactorOptions, FlushOptions, FlushType, PutOptions, Settings,
+    SizeTieredCompactionSchedulerOptions, WriteOptions,
+};
 use slatedb::db_cache::foyer::FoyerCache;
+use slatedb::db_stats::{MULTI_GET_KEYS, REQUEST_COUNT};
+use slatedb::instrumented_object_store_stats::REQUEST_COUNT as OBJECT_STORE_REQUEST_COUNT;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
-use slatedb::{Db, IsolationLevel, MergeOperator, MergeOperatorError};
+use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
+use slatedb::{
+    CompactorBuilder, Db, IsolationLevel, MergeOperator, MergeOperatorError, SstBlockSize,
+};
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 
 // Writes do not wait for durability by default.
 fn no_durable() -> WriteOptions {
@@ -43,6 +54,15 @@ impl MergeOperator for ConcatMergeOperator {
             None => Ok(operand),
         }
     }
+}
+
+/// `Db::flush` only flushes the WAL. This writes the memtable to an L0 SST.
+async fn flush_memtable(db: &Db) {
+    db.flush_with_options(FlushOptions {
+        flush_type: FlushType::MemTable,
+    })
+    .await
+    .unwrap();
 }
 
 fn key(id: usize) -> Vec<u8> {
@@ -80,10 +100,10 @@ async fn populate_random(db: &Db, seed: u64, key_space: usize, ops: usize) -> St
                 .unwrap();
         }
         if rng.random_bool(0.04) {
-            db.flush().await.unwrap();
+            flush_memtable(db).await;
         }
     }
-    db.flush().await.unwrap();
+    flush_memtable(db).await;
     rng
 }
 
@@ -187,10 +207,10 @@ async fn test_multi_get_matches_get_loop_with_merge_operator() {
                 .unwrap();
         }
         if rng.random_bool(0.04) {
-            db.flush().await.unwrap();
+            flush_memtable(&db).await;
         }
     }
-    db.flush().await.unwrap();
+    flush_memtable(&db).await;
     assert_random_batches(&db, &mut rng, key_space).await;
 
     db.close().await.unwrap();
@@ -300,4 +320,200 @@ async fn test_multi_get_db_reader() {
         }
     }
     reader.close().await.unwrap();
+}
+
+/// Same compactor setup as `tests/scan_model.rs`: each L0 flush compacts into
+/// a sorted run of many small SSTs.
+async fn open_compacting_db(path: &str) -> Db {
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let settings = Settings {
+        manifest_poll_interval: Duration::from_millis(10),
+        l0_sst_size_bytes: 1024,
+        l0_max_ssts: 10_000,
+        l0_max_ssts_per_key: 10_000,
+        min_filter_keys: 0,
+        ..Settings::default()
+    };
+    let compactor_options = CompactorOptions {
+        poll_interval: Duration::from_millis(1),
+        commit_compacted_interval: Duration::from_millis(1),
+        scheduler_options: SizeTieredCompactionSchedulerOptions {
+            min_compaction_sources: 1,
+            ..Default::default()
+        }
+        .into(),
+        worker: Some(CompactionWorkerOptions {
+            compactions_poll_interval: Duration::from_millis(1),
+            max_sst_size: 64,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    Db::builder(path, object_store.clone())
+        .with_settings(settings)
+        .with_sst_block_size(SstBlockSize::Block1Kib)
+        .with_compactor_builder(
+            CompactorBuilder::new(path, object_store)
+                .with_scheduler_supplier(Arc::new(SizeTieredCompactionSchedulerSupplier::new()))
+                .with_options(compactor_options),
+        )
+        .build()
+        .await
+        .unwrap()
+}
+
+async fn compact_l0(db: &Db) {
+    flush_memtable(db).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !db.manifest().l0().is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("compactor did not drain L0 within 30s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multi_get_matches_get_loop_after_compaction() {
+    let db = open_compacting_db("/tmp/test_multi_get_compacted").await;
+
+    let key_space = 80;
+    let mut rng = populate_random(&db, 0xC0FFEE, key_space, 300).await;
+    compact_l0(&db).await;
+    let manifest = db.manifest();
+    let run_ssts: usize = manifest
+        .compacted()
+        .iter()
+        .map(|sr| sr.sst_views().len())
+        .sum();
+    assert!(
+        run_ssts > 1,
+        "the fixture must build a sorted run of many SSTs"
+    );
+
+    assert_random_batches(&db, &mut rng, key_space).await;
+
+    db.close().await.unwrap();
+}
+
+fn counter(recorder: &DefaultMetricsRecorder, name: &str, labels: &[(&str, &str)]) -> u64 {
+    recorder
+        .snapshot()
+        .by_name_and_labels(name, labels)
+        .map(|m| match m.value {
+            MetricValue::Counter(v) => v,
+            ref other => panic!("expected counter, got {other:?}"),
+        })
+        .unwrap_or(0)
+}
+
+/// Object store GET requests of the main store.
+fn store_gets(recorder: &DefaultMetricsRecorder) -> u64 {
+    ["get", "get_range", "get_ranges", "head"]
+        .iter()
+        .map(|api| {
+            counter(
+                recorder,
+                OBJECT_STORE_REQUEST_COUNT,
+                &[
+                    ("component", "db"),
+                    ("store_type", "main"),
+                    ("op", "get"),
+                    ("api", api),
+                ],
+            )
+        })
+        .sum()
+}
+
+/// Writes `ssts` L0 SSTs. With `overwrite`, each SST holds a new version of all
+/// keys. Without it, each key lives in one SST.
+async fn open_l0_db(
+    path: &str,
+    cached: bool,
+    keys: &[Vec<u8>],
+    ssts: usize,
+    overwrite: bool,
+) -> (Db, Arc<DefaultMetricsRecorder>) {
+    let recorder = Arc::new(DefaultMetricsRecorder::new());
+    let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let mut builder = Db::builder(path, object_store)
+        .with_settings(Settings {
+            min_filter_keys: 0,
+            compactor_options: None,
+            ..Settings::default()
+        })
+        .with_metrics_recorder(recorder.clone());
+    builder = if cached {
+        builder.with_db_cache(Arc::new(FoyerCache::new()), 0)
+    } else {
+        builder.with_db_cache_disabled()
+    };
+    let db = builder.build().await.unwrap();
+    for sst in 0..ssts {
+        for (i, k) in keys.iter().enumerate() {
+            if overwrite || i % ssts == sst {
+                let v = format!("v{sst}").into_bytes();
+                db.put_with_options(k, &v, &PutOptions::default(), &no_durable())
+                    .await
+                    .unwrap();
+            }
+        }
+        flush_memtable(&db).await;
+    }
+    (db, recorder)
+}
+
+/// Goal 3 of the RFC: a batch sends no more GETs than a `get` loop.
+/// No cache is the cold case. With a cache, one read warms it first.
+async fn assert_batch_gets_not_above_loop(path: &str, num_keys: usize, overwrite: bool) {
+    let keys: Vec<Vec<u8>> = (0..num_keys).map(key).collect();
+    for cached in [false, true] {
+        let path = format!("{path}_{cached}");
+        let (db, recorder) = open_l0_db(&path, cached, &keys, 6, overwrite).await;
+        if cached {
+            db.multi_get(&keys).await.unwrap();
+        }
+
+        let start = store_gets(&recorder);
+        let batch = db.multi_get(&keys).await.unwrap();
+        let batch_gets = store_gets(&recorder) - start;
+
+        let start = store_gets(&recorder);
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(db.get(k).await.unwrap(), batch[i]);
+        }
+        let loop_gets = store_gets(&recorder) - start;
+
+        assert!(
+            batch_gets <= loop_gets,
+            "cached={cached}: batch sent {batch_gets} GETs, loop sent {loop_gets}"
+        );
+        db.close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multi_get_requests_not_above_get_loop_distinct_keys() {
+    assert_batch_gets_not_above_loop("/tmp/test_multi_get_requests_distinct", 32, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "goal 3 holds after MGET_PLAN step 4"]
+async fn test_multi_get_requests_not_above_get_loop_many_versions() {
+    // A small batch, so shared reads cannot hide the reads of shadowed versions.
+    assert_batch_gets_not_above_loop("/tmp/test_multi_get_requests_versions", 2, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multi_get_metrics() {
+    let keys = vec![key(0), key(1), key(0)];
+    let (db, recorder) = open_l0_db("/tmp/test_multi_get_metrics", false, &keys, 1, true).await;
+
+    db.multi_get(&keys).await.unwrap();
+
+    assert_eq!(counter(&recorder, REQUEST_COUNT, &[("op", "multi_get")]), 1);
+    assert_eq!(counter(&recorder, MULTI_GET_KEYS, &[]), 3);
+    assert_eq!(counter(&recorder, REQUEST_COUNT, &[("op", "get")]), 0);
+    db.close().await.unwrap();
 }

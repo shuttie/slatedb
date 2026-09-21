@@ -1,7 +1,7 @@
 use crate::batch::{WriteBatch, WriteBatchIterator};
 use crate::bytes_range::BytesRange;
 use crate::clock::MonotonicClock;
-use crate::config::{DurabilityLevel, ReadOptions, ScanOptions, TracingOptions};
+use crate::config::{DurabilityLevel, MultiGetOptions, ReadOptions, ScanOptions, TracingOptions};
 use crate::db_iter::{apply_filters, DbRecencyIterator, GetIterator};
 use crate::db_state::{SsTableId, SsTableView};
 use crate::db_stats::DbStats;
@@ -93,6 +93,24 @@ impl ReadTrace {
             .as_ref()
             .map(|tracing_options| {
                 tracing::info_span!("slatedb.read", trace_id = tracing_options.trace_id.as_str(),)
+            })
+            .unwrap_or_else(tracing::Span::none);
+        Self {
+            tracing_options,
+            read_span,
+        }
+    }
+
+    /// Same as [`Self::new`], with the batch size on the read span.
+    pub(crate) fn new_multi_get(tracing_options: Option<TracingOptions>, keys: usize) -> Self {
+        let read_span = tracing_options
+            .as_ref()
+            .map(|tracing_options| {
+                tracing::info_span!(
+                    "slatedb.read",
+                    trace_id = tracing_options.trace_id.as_str(),
+                    keys,
+                )
             })
             .unwrap_or_else(tracing::Span::none);
         Self {
@@ -482,12 +500,12 @@ impl Reader {
     pub(crate) async fn multi_get_with_options<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
         db_state: &(dyn DbStateReader + Sync + Send),
         write_batch: Option<&WriteBatch>,
         max_seq: Option<u64>,
     ) -> Result<Vec<Option<RowEntry>>, SlateDBError> {
-        let read_trace = Self::read_trace(options.tracing_options.as_ref());
+        let read_trace = ReadTrace::new_multi_get(options.tracing_options.clone(), keys.len());
         let read = self.multi_get_with_options_inner(
             keys,
             options,
@@ -502,16 +520,17 @@ impl Reader {
     async fn multi_get_with_options_inner<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
-        options: &ReadOptions,
+        options: &MultiGetOptions,
         db_state: &(dyn DbStateReader + Sync + Send),
         write_batch: Option<&WriteBatch>,
         max_seq: Option<u64>,
         read_trace: ReadTrace,
     ) -> Result<Vec<Option<RowEntry>>, SlateDBError> {
+        self.db_stats.multi_get_requests.increment(1);
+        self.db_stats.multi_get_keys.increment(keys.len() as u64);
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        self.db_stats.get_requests.increment(keys.len() as u64);
         let max_seq = self.prepare_max_seq(max_seq, options.durability_filter, options.dirty);
 
         // Deduplicate keys for I/O; results are scattered back to every input
@@ -2010,7 +2029,7 @@ mod tests {
         let multi = reader
             .multi_get_with_options(
                 &batch,
-                &read_options,
+                &MultiGetOptions::default().with_dirty(dirty),
                 &test_db_state,
                 write_batch.as_ref(),
                 max_seq,
