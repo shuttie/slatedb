@@ -119,7 +119,7 @@ to repeat this work for each key:
 
 ## Goals
 
-- Return the same resuls as a `get` for each key, with all keys reading from one state view.
+- Return the same results as a `get` for each key, with all keys reading from one state view.
 - Share the work that a `get` in a loop repeats. Do the setup once per batch.
 - Never cost more than the loop. A batch read sends no more object store requests than a `get` loop, plus at most one filter load per SST whose filter is not in the cache.
 - Bound the concurrency and memory of one batch.
@@ -641,12 +641,71 @@ errors as a `get`.
 
 ### Performance & Cost
 
-<!-- Describe performance and cost implications of this change. -->
+Measured with `slatedb-bencher` (the `mget` command) on a 16 core machine
+with an NVMe disk. Keys of 8 bytes, values of 64 bytes, all keys read at
+random, one reader task, batches of 100 keys, `lookahead` 4. The three
+readers: `seq` is a loop of `get`, `concurrent` is 100 `get` calls in
+flight at once, `multi-get` is one batch. The numbers are the last window
+of a 60 or 120 second run.
 
-- Latency (reads/writes/compactions)
-- Throughput (reads/writes/compactions)
-- Object-store request (GET/LIST/PUT) and cost profile
-- Space, read, and write amplification
+**Reads from RAM.** Local disk, block cache 2 GiB for 1M rows, 4 GiB for
+10M, 16 GiB for 100M. All blocks are cached after the warm-up, so this
+measures the CPU cost per key.
+
+| Rows | Shape (L0 / runs / SSTs) | Reader     | p50 per batch | Keys per second | Rounds |
+|------|--------------------------|------------|---------------|-----------------|--------|
+| 1M   | 2 / 0 / 2                | seq        | 0.87 ms       | 110k            |        |
+|      |                          | concurrent | 1.09 ms       | 90k             |        |
+|      |                          | multi-get  | 0.36 ms       | 269k            | 1.41   |
+| 10M  | 2 / 3 / 14               | seq        | 1.57 ms       | 53k             |        |
+|      |                          | concurrent | 1.84 ms       | 54k             |        |
+|      |                          | multi-get  | 0.59 ms       | 162k            | 1.89   |
+| 100M | 1 / 3 / 44               | seq        | 3.72 ms       | 26k             |        |
+|      |                          | concurrent | 1.77 ms       | 54k             |        |
+|      |                          | multi-get  | 0.80 ms       | 122k            | 1.86   |
+
+A batch is 2 to 3 times faster than a loop of `get` per key. The gain is
+the per key overhead that a batch pays one time: the snapshot, the
+memtable walk, the plan, and the task per SST.
+
+**Reads with object store latency.** The 10M dataset with a delay profile
+in the object store client, both from measured GET latencies: `s3` (p50
+27 ms, p99 113 ms) and `s3x` for S3 Express One Zone (p50 2.5 ms, p99
+9.3 ms). Block cache, meta cache, and disk cache at 256 MiB each, about
+30 percent of the data.
+
+| Profile | Reader     | p50 per batch | p99 per batch | GETs per batch | KiB per batch | Rounds |
+|---------|------------|---------------|---------------|----------------|---------------|--------|
+| s3      | seq        | 3104 ms       | 3353 ms       | 90.3           | 5781          |        |
+|         | concurrent | 120 ms        | 179 ms        | 57.2           | 3660          |        |
+|         | multi-get  | 115 ms        | 183 ms        | 54.6           | 3496          | 1.93   |
+| s3x     | seq        | 296 ms        | 330 ms        | 70.3           | 4501          |        |
+|         | concurrent | 12.1 ms       | 19.3 ms       | 55.7           | 3566          |        |
+|         | multi-get  | 12.2 ms       | 20.4 ms       | 53.9           | 3449          | 1.89   |
+
+With a cold cache, the batch time is the object store tail latency, as for
+the concurrent loop. The batch sends 3 to 5 percent fewer GETs and bytes,
+because keys in the same block share one read. The bytes per batch are
+the same order as for the loop: each key still reads its blocks.
+
+**Requests and cost.** A batch never sends more GETs than a loop of `get`
+on the same snapshot (goal 3), plus at most one filter load per SST with
+no cached filter. A batch sends no LIST and no PUT. Almost every batch of
+100 keys needs a second round for a few keys, because a bloom filter with
+10 bits per key gives about 1 percent false positives. The event loop
+overlaps that round with the first, so a batch pays about one tail
+latency.
+
+**Amplification.** No change to space or write amplification: a batch
+writes nothing and does not change the SST format or compaction. Read
+amplification per key is the same as for `get`, or lower when keys share
+a block. Merged block ranges (`max_coalesced_bytes`) trade some extra
+bytes for fewer GETs.
+
+**Known cost.** In the all-cached case, the event loop is 3 to 5 percent
+slower per batch than a loop that reads all keys in lockstep, because it
+schedules each key on its own. This is the price of the one tail latency
+above.
 
 ### Observability
 
@@ -884,3 +943,4 @@ read before the next pick. This was the second version of this RFC.
 * v1: (xx.07.2026) initial draft
 * v2: (21.09.2026) major update
 * v3: (22.09.2026) the read phase is an event loop, not a loop of steps
+* v3.1: (22.09.2026) measured numbers in Performance & Cost
