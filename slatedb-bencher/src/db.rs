@@ -44,7 +44,7 @@ use futures::{StreamExt, TryStreamExt};
 use rand::{Rng, RngCore, SeedableRng};
 use rand_xorshift::XorShiftRng;
 use slatedb::config::{FlushOptions, FlushType, MultiGetOptions, PutOptions, WriteOptions};
-use slatedb::db_stats::MULTI_GET_WAVES;
+use slatedb::db_stats::MULTI_GET_ROUNDS;
 use slatedb::Db;
 use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tokio::time::Instant;
@@ -92,55 +92,118 @@ impl ReadMode {
             ReadMode::Mget { batch_size, .. } => *batch_size,
         }
     }
+
+    /// Reads the keys of one call with the reader of the mode.
+    pub async fn read(
+        &self,
+        db: &Db,
+        keys: &[Bytes],
+    ) -> Result<Vec<Option<Bytes>>, slatedb::Error> {
+        match self {
+            ReadMode::Get => Ok(vec![db.get(&keys[0]).await?]),
+            ReadMode::Mget {
+                reader: Reader::Seq,
+                ..
+            } => {
+                let mut values = Vec::with_capacity(keys.len());
+                for key in keys {
+                    values.push(db.get(key).await?);
+                }
+                Ok(values)
+            }
+            ReadMode::Mget {
+                reader: Reader::Concurrent,
+                options,
+                ..
+            } => {
+                let gets: Vec<_> = keys.iter().map(|key| db.get(key)).collect();
+                futures::stream::iter(gets)
+                    .buffered(options.max_fetch_tasks)
+                    .try_collect()
+                    .await
+            }
+            ReadMode::Mget {
+                reader: Reader::MultiGet,
+                options,
+                ..
+            } => db.multi_get_with_options(keys, options).await,
+        }
+    }
 }
 
-/// Logs the number of L0 SSTs, sorted runs, and SSTs of the database.
-pub fn log_manifest_shape(db: &Db) {
-    let manifest = db.manifest();
-    let l0_ssts = manifest.l0().len();
-    let sorted_runs = manifest.compacted().len();
-    let ssts = l0_ssts
-        + manifest
-            .compacted()
-            .iter()
-            .map(|run| run.sst_views().len())
-            .sum::<usize>();
-    info!(l0_ssts, sorted_runs, ssts, "manifest shape");
+/// The number of L0 SSTs, sorted runs, and SSTs of the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManifestShape {
+    l0_ssts: usize,
+    sorted_runs: usize,
+    ssts: usize,
 }
 
-/// Flushes the memtable, then waits until the compactor has emptied L0 and
-/// the sorted runs stay the same for a few seconds. Returns after `timeout`
-/// in any case.
+impl ManifestShape {
+    pub fn of(db: &Db) -> Self {
+        let manifest = db.manifest();
+        let l0_ssts = manifest.l0().len();
+        let sorted_runs = manifest.compacted().len();
+        let ssts = l0_ssts
+            + manifest
+                .compacted()
+                .iter()
+                .map(|run| run.sst_views().len())
+                .sum::<usize>();
+        Self {
+            l0_ssts,
+            sorted_runs,
+            ssts,
+        }
+    }
+
+    pub fn log(&self) {
+        let Self {
+            l0_ssts,
+            sorted_runs,
+            ssts,
+        } = *self;
+        info!(l0_ssts, sorted_runs, ssts, "manifest shape");
+    }
+}
+
+/// Flushes the memtable, then waits until the manifest shape stays the same
+/// for `COMPACTION_SETTLE_TIME`. The compactor leaves L0 SSTs in place below
+/// its threshold, so an empty L0 is not the goal. Returns after `timeout` in
+/// any case.
 pub async fn wait_for_compaction(db: &Db, timeout: Duration) {
+    /// How often the loop reads the manifest.
     const POLL: Duration = Duration::from_millis(500);
-    const STABLE_POLLS: u32 = 10;
+    /// A shape that stays the same this long is final. The time must be
+    /// longer than the poll interval of the compactor, which is 5 seconds
+    /// by default, so the compactor had a chance to schedule the next step.
+    const COMPACTION_SETTLE_TIME: Duration = Duration::from_secs(12);
+    let stable_polls = COMPACTION_SETTLE_TIME.as_millis() / POLL.as_millis();
     let flush = FlushOptions {
         flush_type: FlushType::MemTable,
     };
     if let Err(e) = db.flush_with_options(flush).await {
         warn!("memtable flush failed [error={}]", e);
     }
-    log_manifest_shape(db);
     let start = Instant::now();
-    let mut last_runs = None;
+    let mut last_shape = ManifestShape::of(db);
     let mut stable = 0;
     while start.elapsed() < timeout {
-        let manifest = db.manifest();
-        let runs = manifest.compacted().len();
-        if manifest.l0().is_empty() && last_runs == Some(runs) {
+        tokio::time::sleep(POLL).await;
+        let shape = ManifestShape::of(db);
+        if shape == last_shape {
             stable += 1;
         } else {
             stable = 0;
+            last_shape = shape;
         }
-        last_runs = Some(runs);
-        if stable >= STABLE_POLLS {
-            log_manifest_shape(db);
+        if stable >= stable_polls {
+            shape.log();
             return;
         }
-        tokio::time::sleep(POLL).await;
     }
     warn!("compaction did not settle before the timeout");
-    log_manifest_shape(db);
+    ManifestShape::of(db).log();
 }
 
 /// A key generator trait that generates keys for the benchmarker.
@@ -211,6 +274,15 @@ pub struct FixedSetKeyGenerator {
     keys: Vec<Bytes>,
     rng: XorShiftRng,
     used_keys: Vec<Bytes>,
+    /// The walk over the set, or `None` for random picks. See [`Self::walk`].
+    walk: Option<Walk>,
+}
+
+/// A walk over the fixed set. Task `start` of `stride` tasks visits the keys
+/// `start`, `start + stride`, `start + 2 * stride`, and so on.
+struct Walk {
+    next: usize,
+    stride: usize,
 }
 
 impl FixedSetKeyGenerator {
@@ -231,12 +303,32 @@ impl FixedSetKeyGenerator {
             keys,
             rng: rng_from(pick_seed),
             used_keys: Vec::new(),
+            walk: None,
         }
+    }
+
+    /// Makes the generator cover the whole set.
+    ///
+    /// `next_key` walks the set in order, so a load of `key_count` rows
+    /// writes each key one time. With more than one task, task `start` of
+    /// `stride` tasks walks its own slice. `used_key` picks from the whole
+    /// set, so a read run after such a load reads every loaded key.
+    pub fn walk(mut self, start: usize, stride: usize) -> Self {
+        self.walk = Some(Walk {
+            next: start,
+            stride,
+        });
+        self
     }
 }
 
 impl KeyGenerator for FixedSetKeyGenerator {
     fn next_key(&mut self) -> Bytes {
+        if let Some(walk) = &mut self.walk {
+            let key = self.keys[walk.next % self.keys.len()].clone();
+            walk.next += walk.stride;
+            return key;
+        }
         let index = self.rng.random_range(0..self.keys.len());
         let key = self.keys[index].clone();
         self.used_keys.push(key.clone());
@@ -244,6 +336,10 @@ impl KeyGenerator for FixedSetKeyGenerator {
     }
 
     fn used_key(&mut self) -> Bytes {
+        if self.walk.is_some() {
+            let index = self.rng.random_range(0..self.keys.len());
+            return self.keys[index].clone();
+        }
         if self.used_keys.is_empty() {
             return self.next_key();
         }
@@ -420,7 +516,7 @@ impl Task {
             } else {
                 let keys = self.read_keys(&mut random);
                 let read_start = Instant::now();
-                match Self::read(&self.db, &self.read_mode, &keys).await {
+                match self.read_mode.read(&self.db, &keys).await {
                     Ok(values) => {
                         latencies.push(read_start.elapsed());
                         gets += values.len() as u64;
@@ -461,46 +557,6 @@ impl Task {
                 }
             })
             .collect()
-    }
-
-    /// Reads the keys of one call with the reader of the read mode.
-    ///
-    /// The function does not borrow the task, because the key generator is
-    /// not `Sync` and the future must be `Send`.
-    async fn read(
-        db: &Db,
-        read_mode: &ReadMode,
-        keys: &[Bytes],
-    ) -> Result<Vec<Option<Bytes>>, slatedb::Error> {
-        match read_mode {
-            ReadMode::Get => Ok(vec![db.get(&keys[0]).await?]),
-            ReadMode::Mget {
-                reader: Reader::Seq,
-                ..
-            } => {
-                let mut values = Vec::with_capacity(keys.len());
-                for key in keys {
-                    values.push(db.get(key).await?);
-                }
-                Ok(values)
-            }
-            ReadMode::Mget {
-                reader: Reader::Concurrent,
-                options,
-                ..
-            } => {
-                let gets: Vec<_> = keys.iter().map(|key| db.get(key)).collect();
-                futures::stream::iter(gets)
-                    .buffered(options.max_fetch_tasks)
-                    .try_collect()
-                    .await
-            }
-            ReadMode::Mget {
-                reader: Reader::MultiGet,
-                options,
-                ..
-            } => db.multi_get_with_options(keys, options).await,
-        }
     }
 }
 
@@ -550,7 +606,49 @@ struct DbStatsRecorder {
     /// Read calls since the start. One call reads one key or one batch.
     total_calls: AtomicU64,
     /// Latency samples of the read calls since the last stats dump.
-    latencies: Mutex<Vec<Duration>>,
+    latencies: Mutex<LatencySamples>,
+}
+
+/// A bounded set of latency samples. Above `MAX_LATENCY_SAMPLES`, a new
+/// sample replaces a random old one, so recent calls weigh more.
+struct LatencySamples {
+    samples: Vec<Duration>,
+    rng: XorShiftRng,
+}
+
+impl LatencySamples {
+    fn new() -> Self {
+        Self {
+            samples: Vec::new(),
+            rng: XorShiftRng::from_os_rng(),
+        }
+    }
+
+    fn record(&mut self, sample: Duration) {
+        if self.samples.len() < MAX_LATENCY_SAMPLES {
+            self.samples.push(sample);
+        } else {
+            let idx = self.rng.random_range(0..self.samples.len());
+            self.samples[idx] = sample;
+        }
+    }
+
+    /// Returns the sorted samples and leaves the set empty.
+    fn take_sorted(&mut self) -> Vec<Duration> {
+        let mut samples = std::mem::take(&mut self.samples);
+        samples.sort_unstable();
+        samples
+    }
+
+    /// Returns the value at quantile `q` of sorted samples, or zero with no
+    /// samples.
+    fn percentile(sorted: &[Duration], q: f64) -> Duration {
+        if sorted.is_empty() {
+            return Duration::ZERO;
+        }
+        let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
+        sorted[idx]
+    }
 }
 
 impl DbStatsRecorder {
@@ -563,32 +661,23 @@ impl DbStatsRecorder {
             total_gets_bytes: AtomicU64::new(0),
             total_gets_hits: AtomicU64::new(0),
             total_calls: AtomicU64::new(0),
-            latencies: Mutex::new(Vec::new()),
+            latencies: Mutex::new(LatencySamples::new()),
         }
     }
 
-    /// Moves the samples into the recorder. Above `MAX_LATENCY_SAMPLES`, a
-    /// new sample replaces a random old one, so the memory stays bounded.
+    /// Moves the samples of `samples.len()` read calls into the recorder.
     fn record_latencies(&self, samples: &mut Vec<Duration>) {
         self.total_calls
             .fetch_add(samples.len() as u64, Ordering::Relaxed);
         let mut latencies = self.latencies.lock().expect("lock failed");
-        let mut rng = XorShiftRng::from_os_rng();
         for sample in samples.drain(..) {
-            if latencies.len() < MAX_LATENCY_SAMPLES {
-                latencies.push(sample);
-            } else {
-                let idx = rng.random_range(0..latencies.len());
-                latencies[idx] = sample;
-            }
+            latencies.record(sample);
         }
     }
 
     /// Returns the sorted samples since the last call.
     fn take_latencies(&self) -> Vec<Duration> {
-        let mut samples = std::mem::take(&mut *self.latencies.lock().expect("lock failed"));
-        samples.sort_unstable();
-        samples
+        self.latencies.lock().expect("lock failed").take_sorted()
     }
 
     fn calls(&self) -> u64 {
@@ -640,38 +729,63 @@ impl DbStatsRecorder {
     }
 }
 
-/// Returns the value at quantile `q` of sorted samples, or zero with no samples.
-fn percentile(sorted: &[Duration], q: f64) -> Duration {
-    if sorted.is_empty() {
-        return Duration::ZERO;
-    }
-    let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
-    sorted[idx]
-}
-
-/// Reads the `multi_get_waves` counter from the metrics recorder.
-fn waves(recorder: &DefaultMetricsRecorder) -> u64 {
-    recorder
-        .snapshot()
-        .by_name(MULTI_GET_WAVES)
-        .first()
-        .and_then(|metric| match metric.value {
-            MetricValue::Counter(value) => Some(value),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
-/// The per call numbers of one dump interval. They are ratios of shared
-/// counters, so with more than one task they are averages over all tasks.
-struct CallStats {
+/// The read call counters since the start of the run. The difference of two
+/// snapshots gives the numbers of one dump interval. The counters are shared
+/// by all tasks, so the per call numbers are averages over the tasks.
+#[derive(Clone, Copy, Debug)]
+struct ReadCallCounters {
+    /// Read calls. One call reads one key or one batch.
     calls: u64,
+    /// GET requests for `.sst` objects.
     sst_gets: u64,
+    /// Bytes read from `.sst` objects.
     sst_bytes: u64,
-    waves: u64,
+    /// GET requests for all other objects, for example manifests.
+    other_gets: u64,
+    /// Rounds of the `multi_get` calls.
+    rounds: u64,
 }
 
-impl CallStats {
+impl ReadCallCounters {
+    fn snapshot(
+        stats: &DbStatsRecorder,
+        store: &BenchObjectStore,
+        recorder: &DefaultMetricsRecorder,
+    ) -> Self {
+        let counters = store.counters();
+        Self {
+            calls: stats.calls(),
+            sst_gets: counters.sst_gets,
+            sst_bytes: counters.sst_bytes,
+            other_gets: counters.other_gets,
+            rounds: Self::rounds(recorder),
+        }
+    }
+
+    /// Reads the `multi_get_rounds` counter from the metrics recorder.
+    fn rounds(recorder: &DefaultMetricsRecorder) -> u64 {
+        recorder
+            .snapshot()
+            .by_name(MULTI_GET_ROUNDS)
+            .first()
+            .and_then(|metric| match metric.value {
+                MetricValue::Counter(value) => Some(value),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// Returns the counts between the `last` snapshot and this one.
+    fn since(&self, last: &Self) -> Self {
+        Self {
+            calls: self.calls - last.calls,
+            sst_gets: self.sst_gets - last.sst_gets,
+            sst_bytes: self.sst_bytes - last.sst_bytes,
+            other_gets: self.other_gets - last.other_gets,
+            rounds: self.rounds - last.rounds,
+        }
+    }
+
     fn per_call(&self, value: u64) -> f64 {
         if self.calls == 0 {
             0.0
@@ -688,9 +802,7 @@ async fn dump_stats(
 ) {
     let mut last_stats_dump: Option<Instant> = None;
     let mut first_dump_start: Option<Instant> = None;
-    let mut last_calls = stats.calls();
-    let mut last_counters = store.counters();
-    let mut last_waves = waves(&recorder);
+    let mut last_counters = ReadCallCounters::snapshot(&stats, &store, &recorder);
     loop {
         tokio::time::sleep(REPORT_INTERVAL).await;
 
@@ -724,18 +836,9 @@ async fn dump_stats(
                 };
 
                 // The per call numbers cover the time since the last dump.
-                let calls = stats.calls();
-                let counters = store.counters();
-                let waves_now = waves(&recorder);
-                let call_stats = CallStats {
-                    calls: calls - last_calls,
-                    sst_gets: counters.sst_gets - last_counters.sst_gets,
-                    sst_bytes: counters.sst_bytes - last_counters.sst_bytes,
-                    waves: waves_now - last_waves,
-                };
-                last_calls = calls;
+                let counters = ReadCallCounters::snapshot(&stats, &store, &recorder);
+                let call_stats = counters.since(&last_counters);
                 last_counters = counters;
-                last_waves = waves_now;
                 let latencies = stats.take_latencies();
 
                 info!(
@@ -751,17 +854,89 @@ async fn dump_stats(
                     gets,
                 );
                 info!(
-                    "read calls [calls: {}, p50: {:.3} ms, p99: {:.3} ms, sst gets/call: {:.3}, sst KiB/call: {:.3}, waves/call: {:.3}, other gets: {}]",
+                    "read calls [calls: {}, p50: {:.3} ms, p99: {:.3} ms, sst gets/call: {:.3}, sst KiB/call: {:.3}, rounds/call: {:.3}, other gets: {}]",
                     call_stats.calls,
-                    percentile(&latencies, 0.5).as_secs_f64() * 1000.0,
-                    percentile(&latencies, 0.99).as_secs_f64() * 1000.0,
+                    LatencySamples::percentile(&latencies, 0.5).as_secs_f64() * 1000.0,
+                    LatencySamples::percentile(&latencies, 0.99).as_secs_f64() * 1000.0,
                     call_stats.per_call(call_stats.sst_gets),
                     call_stats.per_call(call_stats.sst_bytes) / 1024.0,
-                    call_stats.per_call(call_stats.waves),
-                    counters.other_gets,
+                    call_stats.per_call(call_stats.rounds),
+                    call_stats.other_gets,
                 );
                 last_stats_dump = Some(range.end);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn test_walk_covers_the_set_one_time() {
+        let key_count = 10;
+        let tasks = 3;
+        let set: BTreeSet<Bytes> = FixedSetKeyGenerator::new(8, key_count, Some(7), None)
+            .keys
+            .into_iter()
+            .collect();
+        let mut walked = Vec::new();
+        for task in 0..tasks {
+            let mut walker =
+                FixedSetKeyGenerator::new(8, key_count, Some(7), None).walk(task, tasks);
+            let share = (key_count as usize - task).div_ceil(tasks);
+            for _ in 0..share {
+                walked.push(walker.next_key());
+            }
+        }
+        assert_eq!(walked.len(), key_count as usize);
+        let walked: BTreeSet<Bytes> = walked.into_iter().collect();
+        assert_eq!(walked, set);
+    }
+
+    #[test]
+    fn test_same_seeds_give_the_same_keys() {
+        let mut first = FixedSetKeyGenerator::new(8, 100, Some(1), Some(2));
+        let mut second = FixedSetKeyGenerator::new(8, 100, Some(1), Some(2));
+        let mut other_pick = FixedSetKeyGenerator::new(8, 100, Some(1), Some(3));
+        assert_eq!(first.keys, second.keys);
+        assert_eq!(first.keys, other_pick.keys);
+        let first_keys: Vec<_> = (0..20).map(|_| first.next_key()).collect();
+        let second_keys: Vec<_> = (0..20).map(|_| second.next_key()).collect();
+        let other_keys: Vec<_> = (0..20).map(|_| other_pick.next_key()).collect();
+        assert_eq!(first_keys, second_keys);
+        assert_ne!(first_keys, other_keys);
+    }
+
+    #[test]
+    fn test_percentile() {
+        assert_eq!(LatencySamples::percentile(&[], 0.5), Duration::ZERO);
+        let sorted: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
+        assert_eq!(
+            LatencySamples::percentile(&sorted, 0.5),
+            Duration::from_millis(51)
+        );
+        assert_eq!(
+            LatencySamples::percentile(&sorted, 0.99),
+            Duration::from_millis(99)
+        );
+        assert_eq!(
+            LatencySamples::percentile(&sorted, 1.0),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn test_samples_stay_bounded() {
+        let mut samples = LatencySamples::new();
+        for millis in 0..(MAX_LATENCY_SAMPLES as u64 + 10) {
+            samples.record(Duration::from_millis(millis));
+        }
+        let sorted = samples.take_sorted();
+        assert_eq!(sorted.len(), MAX_LATENCY_SAMPLES);
+        assert!(sorted.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(samples.take_sorted().is_empty());
     }
 }

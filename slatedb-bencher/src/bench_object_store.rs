@@ -103,14 +103,13 @@ pub struct Counters {
 }
 
 /// An object store that counts SST reads and can delay them.
-#[derive(Clone)]
 pub struct BenchObjectStore {
     inner: Arc<dyn ObjectStore>,
     delay: Option<DelayProfile>,
-    sst_gets: Arc<AtomicU64>,
-    sst_bytes: Arc<AtomicU64>,
-    other_gets: Arc<AtomicU64>,
-    rng: Arc<Mutex<XorShiftRng>>,
+    sst_gets: AtomicU64,
+    sst_bytes: AtomicU64,
+    other_gets: AtomicU64,
+    rng: Mutex<XorShiftRng>,
 }
 
 impl BenchObjectStore {
@@ -118,10 +117,10 @@ impl BenchObjectStore {
         Self {
             inner,
             delay,
-            sst_gets: Arc::new(AtomicU64::new(0)),
-            sst_bytes: Arc::new(AtomicU64::new(0)),
-            other_gets: Arc::new(AtomicU64::new(0)),
-            rng: Arc::new(Mutex::new(XorShiftRng::seed_from_u64(0))),
+            sst_gets: AtomicU64::new(0),
+            sst_bytes: AtomicU64::new(0),
+            other_gets: AtomicU64::new(0),
+            rng: Mutex::new(XorShiftRng::seed_from_u64(0)),
         }
     }
 

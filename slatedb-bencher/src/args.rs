@@ -89,6 +89,20 @@ pub(crate) struct DbArgs {
 
     #[arg(
         long,
+        requires = "disk_cache",
+        help = "The size in bytes of the object store disk cache. Needs --disk-cache."
+    )]
+    pub(crate) disk_cache_size: Option<usize>,
+
+    #[arg(
+        long,
+        requires = "disk_cache",
+        help = "The size in bytes of one part file of the object store disk cache. Needs --disk-cache."
+    )]
+    pub(crate) disk_cache_part_size: Option<usize>,
+
+    #[arg(
+        long,
         value_enum,
         help = "Add a delay to each object store read, sampled from a measured latency profile.",
         default_value_t = DelayProfileKind::None
@@ -110,7 +124,14 @@ impl DbArgs {
         } else {
             Settings::load()?
         };
-        if !self.disk_cache {
+        if self.disk_cache {
+            if let Some(size) = self.disk_cache_size {
+                settings.object_store_cache_options.max_cache_size_bytes = Some(size);
+            }
+            if let Some(size) = self.disk_cache_part_size {
+                settings.object_store_cache_options.part_size_bytes = size;
+            }
+        } else {
             settings.object_store_cache_options.root_folder = None;
         }
 
@@ -259,6 +280,13 @@ pub(crate) struct BenchmarkDbArgs {
     )]
     pub(crate) wait_compaction: bool,
 
+    #[arg(
+        long,
+        help = "FixedSet covers the whole set: a load writes each key one time, and a read run picks from all keys.",
+        default_value_t = false
+    )]
+    pub(crate) all_keys: bool,
+
     #[command(subcommand)]
     pub(crate) mode: Option<DbMode>,
 }
@@ -292,7 +320,7 @@ pub(crate) struct MgetArgs {
 
     #[arg(
         long,
-        help = "Max known-positive SSTs that a key reads in wave 2 and later.",
+        help = "Max known-positive SSTs that a key reads in the second round and later.",
         default_value_t = 4
     )]
     pub(crate) lookahead: usize,
@@ -353,34 +381,60 @@ pub(crate) trait KeyGeneratorSupplier {
         None
     }
 
+    /// The number of tasks that share the key set. See [`Self::all_keys`].
+    fn concurrency(&self) -> u32 {
+        1
+    }
+
+    /// When true, the fixed set generator walks the whole set. See
+    /// [`FixedSetKeyGenerator::walk`].
+    fn all_keys(&self) -> bool {
+        false
+    }
+
     fn key_gen_supplier(&self) -> Box<dyn Fn() -> Box<dyn KeyGenerator>> {
         let key_len = self.key_len();
         let key_count = self.key_count();
         let seed = self.seed();
-        // Each task gets its own pick seed, so the tasks do not read the
-        // same keys in the same order.
-        let tasks = AtomicU64::new(0);
-        let task_seed = move || seed.map(|s| s.wrapping_add(tasks.fetch_add(1, Ordering::Relaxed)));
+        let all_keys = self.all_keys();
+        let tasks = self.concurrency().max(1) as usize;
+        // Each call of the supplier gets the next task index. See
+        // [`task_seed`] and [`FixedSetKeyGenerator::walk`] for its use.
+        let next_task = AtomicU64::new(0);
         let supplier: Box<dyn Fn() -> Box<dyn KeyGenerator>> = match self.key_generator() {
             KeyGeneratorType::Random => {
                 info!(key_len, "using random key generator");
-                Box::new(move || Box::new(RandomKeyGenerator::new(key_len, task_seed())))
+                Box::new(move || {
+                    let task = next_task.fetch_add(1, Ordering::Relaxed);
+                    Box::new(RandomKeyGenerator::new(key_len, task_seed(seed, task)))
+                })
             }
             KeyGeneratorType::FixedSet => {
-                info!(key_len, key_count, "using fixed set key generator");
+                info!(
+                    key_len,
+                    key_count, all_keys, "using fixed set key generator"
+                );
                 Box::new(move || {
-                    Box::new(FixedSetKeyGenerator::new(
-                        key_len,
-                        key_count,
-                        seed,
-                        task_seed(),
-                    ))
+                    let task = next_task.fetch_add(1, Ordering::Relaxed);
+                    let generator =
+                        FixedSetKeyGenerator::new(key_len, key_count, seed, task_seed(seed, task));
+                    if all_keys {
+                        Box::new(generator.walk(task as usize, tasks))
+                    } else {
+                        Box::new(generator)
+                    }
                 })
             }
         };
 
         supplier
     }
+}
+
+/// The pick seed of one task. Each task gets its own seed, so the tasks do
+/// not read the same keys in the same order.
+fn task_seed(seed: Option<u64>, task: u64) -> Option<u64> {
+    seed.map(|seed| seed.wrapping_add(task))
 }
 
 impl KeyGeneratorSupplier for BenchmarkDbArgs {
@@ -398,6 +452,14 @@ impl KeyGeneratorSupplier for BenchmarkDbArgs {
 
     fn seed(&self) -> Option<u64> {
         self.seed
+    }
+
+    fn concurrency(&self) -> u32 {
+        self.concurrency
+    }
+
+    fn all_keys(&self) -> bool {
+        self.all_keys
     }
 }
 

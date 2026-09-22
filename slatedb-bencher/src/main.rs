@@ -7,7 +7,7 @@ use args::{
 };
 use bytes::Bytes;
 use clap::Parser;
-use db::{log_manifest_shape, wait_for_compaction, DbBench, ReadMode};
+use db::{wait_for_compaction, DbBench, ManifestShape, ReadMode};
 use futures::StreamExt;
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -98,7 +98,7 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
     }
 
     let db = Arc::new(builder.build().await.unwrap());
-    log_manifest_shape(&db);
+    ManifestShape::of(&db).log();
     let read_mode = match &args.mode {
         None => ReadMode::Get,
         Some(DbMode::Mget(mget)) => {
