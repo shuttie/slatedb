@@ -16,6 +16,7 @@ use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::manifest::{ManifestCore, Segment};
 use crate::reader::SstTraceLevel;
 
+use super::key::KeyRead;
 use super::sst::{filter_keys, view_holds_key, PendingKey};
 
 /// The keys of a batch: sorted, with no duplicates.
@@ -127,14 +128,14 @@ impl Plan {
         &mut self,
         sst: usize,
         filters: Arc<[NamedFilter]>,
-        resolved: &[bool],
+        is_done: impl Fn(usize) -> bool,
         filter_context: &Option<FilterContext>,
         db_stats: Option<&DbStats>,
     ) {
         let open: Vec<PendingKey> = self.ssts[sst]
             .keys
             .iter()
-            .filter(|pk| !resolved[pk.idx])
+            .filter(|pk| !is_done(pk.idx))
             .cloned()
             .collect();
         // Sorted, as `open` is.
@@ -186,13 +187,9 @@ pub(crate) fn pick_next(candidates: &[Candidate], has_operand: bool, lookahead: 
 
 /// The SSTs that can hold the open keys, newest first inside each LSM tree.
 /// `keys` must be sorted. The `filters` of each SST start as `None`.
-pub(crate) async fn candidate_ssts(
-    core: &ManifestCore,
-    keys: &[Bytes],
-    resolved: &[bool],
-) -> Vec<PlanSst> {
+pub(crate) async fn candidate_ssts(core: &ManifestCore, keys: &[KeyRead]) -> Vec<PlanSst> {
     let mut ssts = Vec::new();
-    for (segment, keys) in group_by_segment(core, keys, resolved) {
+    for (segment, keys) in group_by_segment(core, keys) {
         let tree = &segment.tree;
         let mut push = |view: &SsTableView, level: SstTraceLevel, keys: Vec<PendingKey>| {
             if !keys.is_empty() {
@@ -230,18 +227,14 @@ pub(crate) async fn candidate_ssts(
 
 /// Group the open keys by the segment that covers them. Trees cover disjoint
 /// keys, so the order of the groups has no effect on a key.
-fn group_by_segment(
-    core: &ManifestCore,
-    keys: &[Bytes],
-    resolved: &[bool],
-) -> Vec<(Segment, Vec<PendingKey>)> {
+fn group_by_segment(core: &ManifestCore, keys: &[KeyRead]) -> Vec<(Segment, Vec<PendingKey>)> {
     let default_segment = core.default_segment();
     // The map key is the tree's Arc pointer cast to `usize` (a raw pointer
     // would make the enclosing future `!Send`).
     let mut group_of: HashMap<usize, usize> = HashMap::new();
     let mut groups: Vec<(Segment, Vec<PendingKey>)> = Vec::new();
-    for (idx, key) in keys.iter().enumerate() {
-        if resolved[idx] {
+    for (idx, KeyRead { key, done, .. }) in keys.iter().enumerate() {
+        if *done {
             continue;
         }
         let segment =
@@ -335,6 +328,16 @@ mod tests {
 
     fn sorted_keys(keys: &[&str]) -> Vec<Bytes> {
         BatchKeys::new(keys).keys
+    }
+
+    fn key_reads(keys: &[&str], done: &[bool]) -> Vec<KeyRead> {
+        let keys = sorted_keys(keys).into_iter().zip(done);
+        let reads = keys.map(|(key, &done)| {
+            let mut read = KeyRead::new(key);
+            read.done = done;
+            read
+        });
+        reads.collect()
     }
 
     fn pending(keys: &[Bytes]) -> Vec<PendingKey> {
@@ -452,7 +455,7 @@ mod tests {
         let mut core = ManifestCore::new();
         core.tree = tree(l0, runs);
 
-        let ssts = candidate_ssts(&core, &sorted_keys(keys), resolved).await;
+        let ssts = candidate_ssts(&core, &key_reads(keys, resolved)).await;
 
         let expected: Vec<(String, Vec<usize>)> = expected
             .into_iter()
@@ -478,8 +481,8 @@ mod tests {
             },
         ];
 
-        let keys = sorted_keys(&["a/5", "b/5", "c/5"]);
-        let ssts = candidate_ssts(&core, &keys, &[false; 3]).await;
+        let keys = key_reads(&["a/5", "b/5", "c/5"], &[false; 3]);
+        let ssts = candidate_ssts(&core, &keys).await;
 
         assert_eq!(
             labels(&ssts),
@@ -565,7 +568,7 @@ mod tests {
         let ssts = vec![plan_sst(None, &keys, &[1]), plan_sst(None, &keys, &[0, 1])];
         let mut plan = Plan::new(ssts, keys.len(), &None, None);
 
-        plan.apply_filters(1, filters_of(&filter_keys), &resolved, &None, None);
+        plan.apply_filters(1, filters_of(&filter_keys), |u| resolved[u], &None, None);
 
         assert!(plan.ssts[1].filters.is_some());
         assert_eq!(plan.candidates[0], candidates(&expected_a));

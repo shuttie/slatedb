@@ -8,6 +8,7 @@
 //!   memtables, builds the plan, runs the pipeline, and resolves each key
 //!   with the components of the single-key `get` path.
 
+mod key;
 mod pipeline;
 mod plan;
 mod sst;
@@ -25,8 +26,9 @@ use crate::mem_table::KVTable;
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorRequiredIterator};
 use crate::reader::{DbStateReader, ReadTrace, Reader};
 use crate::sst_iter::SstIteratorOptions;
-use crate::types::{RowEntry, ValueDeletable};
+use crate::types::RowEntry;
 
+use key::KeyRead;
 use pipeline::Pipeline;
 use plan::{candidate_ssts, BatchKeys, Plan};
 
@@ -88,15 +90,7 @@ impl Reader {
         // Duplicates resolve one time. The results are scattered back to every
         // input position at the end.
         let batch = BatchKeys::new(keys);
-        let n = batch.keys.len();
-
-        // Per unique key: write-batch entries (unfiltered, highest precedence),
-        // everything-else entries (memtable + on-disk), and whether a base
-        // (Value/Tombstone) has been found yet. `append_versions` is the sole
-        // writer into `acc`, so every entry there is already max_seq filtered.
-        let mut wb_acc: Vec<Vec<RowEntry>> = vec![Vec::new(); n];
-        let mut acc: Vec<Vec<RowEntry>> = vec![Vec::new(); n];
-        let mut resolved: Vec<bool> = vec![false; n];
+        let mut key_reads: Vec<KeyRead> = batch.keys.iter().cloned().map(KeyRead::new).collect();
 
         // 1. Write batch (transaction only). Entries carry seq u64::MAX and are
         //    not max_seq filtered (hence `None`), matching the single-key get
@@ -115,10 +109,7 @@ impl Reader {
             iter.init().await?;
             while let Some(entry) = iter.next().await? {
                 if let Some(u) = batch.position(entry.key.as_ref()) {
-                    if !matches!(entry.value, ValueDeletable::Merge(_)) {
-                        resolved[u] = true;
-                    }
-                    wb_acc[u].push(entry);
+                    key_reads[u].push_write(entry);
                 }
                 // Keep the in-memory walk cooperative.
                 tokio::task::coop::consume_budget().await;
@@ -127,39 +118,28 @@ impl Reader {
 
         // 2. Active memtable, then immutable memtables (newest-first).
         let memtable = db_state.memtable();
-        read_memtable_layer(
-            &memtable,
-            &batch.keys,
-            max_seq,
-            &read_trace,
-            &mut acc,
-            &mut resolved,
-        )
-        .await;
+        read_memtable_layer(&memtable, &mut key_reads, max_seq, &read_trace).await;
         for imm in db_state.imm_memtable() {
-            read_memtable_layer(
-                &imm.table(),
-                &batch.keys,
-                max_seq,
-                &read_trace,
-                &mut acc,
-                &mut resolved,
-            )
-            .await;
+            read_memtable_layer(&imm.table(), &mut key_reads, max_seq, &read_trace).await;
         }
 
         // 3. Plan: the SSTs that can hold each open key. Only filters that are
         //    in the cache take part, so the plan sends no request.
-        let mut ssts = candidate_ssts(db_state.core(), &batch.keys, &resolved).await;
+        let mut ssts = candidate_ssts(db_state.core(), &key_reads).await;
         for sst in ssts.iter_mut() {
             sst.filters = self.table_store.cached_filters(&sst.view.sst).await;
             // Keep cached lookups cooperative.
             tokio::task::coop::consume_budget().await;
         }
-        let mut plan = Plan::new(ssts, n, &options.filter_context, Some(&self.db_stats));
+        let mut plan = Plan::new(
+            ssts,
+            key_reads.len(),
+            &options.filter_context,
+            Some(&self.db_stats),
+        );
         // A key with no candidates has nothing to read.
-        for (u, candidates) in plan.candidates.iter().enumerate() {
-            resolved[u] |= candidates.is_empty();
+        for (key, candidates) in key_reads.iter_mut().zip(&plan.candidates) {
+            key.done |= candidates.is_empty();
         }
 
         // 4. Read. Each open key reads its candidates newest first, in
@@ -168,31 +148,23 @@ impl Reader {
         let pipeline = Pipeline::new(
             self,
             &mut plan,
-            &batch.keys,
+            &mut key_reads,
             max_seq,
             options,
             &read_trace,
-            &wb_acc,
-            &mut acc,
-            &mut resolved,
         );
         let rounds = pipeline.run().await?;
         self.db_stats.multi_get_rounds.increment(rounds);
         read_trace.read_span().record("rounds", rounds);
 
         // 5. Resolve each unique key, then scatter to input positions.
-        let mut values: Vec<Option<RowEntry>> = Vec::with_capacity(n);
-        for u in 0..n {
-            let wb_entries = std::mem::take(&mut wb_acc[u]);
-            let rest_entries = std::mem::take(&mut acc[u]);
-            values.push(
-                self.resolve_entry(&batch.keys[u], wb_entries, rest_entries)
-                    .await?,
-            );
+        let mut values: Vec<Option<RowEntry>> = Vec::with_capacity(key_reads.len());
+        for key in key_reads {
+            values.push(self.resolve_entry(&key.key, key.wb, key.acc).await?);
             // Keep in-memory resolution cooperative.
             tokio::task::coop::consume_budget().await;
         }
-        if keys.len() == n {
+        if keys.len() == values.len() {
             // No duplicates: each value moves to its one slot.
             return Ok(batch.slots.iter().map(|&u| values[u].take()).collect());
         }
@@ -205,7 +177,7 @@ impl Reader {
     /// missing or deleted key.
     ///
     /// No max_seq filtering happens here: `rest_entries` were already filtered
-    /// on append (see [`append_versions`]) and write-batch entries are exempt
+    /// on append (see [`KeyRead::append`]) and write-batch entries are exempt
     /// by design.
     async fn resolve_entry(
         &self,
@@ -253,47 +225,19 @@ fn sst_options(options: &MultiGetOptions, segment: &Bytes) -> SstIteratorOptions
     }
 }
 
-/// Append versions of one key to its accumulator, newest-first. Entries with
-/// `seq > max_seq` are dropped (not visible at this snapshot) — the filter runs
-/// *before* the resolve check, so a too-new `Value` must not resolve the key.
-/// The first appended `Value` or `Tombstone` marks the key resolved and stops
-/// the append: everything older is shadowed and would never be read by the
-/// resolution iterators anyway. `Merge` operands keep accumulating (they
-/// legitimately span layers).
-fn append_versions(
-    entries: Vec<RowEntry>,
-    max_seq: Option<u64>,
-    acc: &mut Vec<RowEntry>,
-    resolved: &mut bool,
-) {
-    for entry in entries {
-        if max_seq.is_some_and(|ms| entry.seq > ms) {
-            continue;
-        }
-        let is_base = !matches!(entry.value, ValueDeletable::Merge(_));
-        acc.push(entry);
-        if is_base {
-            *resolved = true;
-            return;
-        }
-    }
-}
-
 /// Probe an in-memory table for every still-pending key, appending its versions.
 async fn read_memtable_layer(
     table: &KVTable,
-    unique_keys: &[Bytes],
+    keys: &mut [KeyRead],
     max_seq: Option<u64>,
     read_trace: &ReadTrace,
-    acc: &mut [Vec<RowEntry>],
-    resolved: &mut [bool],
 ) {
-    for (u, key) in unique_keys.iter().enumerate() {
-        if resolved[u] {
+    for key in keys.iter_mut() {
+        if key.done {
             continue;
         }
-        let entries = kv_table_get_versions(table, key, read_trace);
-        append_versions(entries, max_seq, &mut acc[u], &mut resolved[u]);
+        let entries = kv_table_get_versions(table, &key.key, read_trace);
+        key.append(entries, max_seq);
         // Keep in-memory lookups cooperative.
         tokio::task::coop::consume_budget().await;
     }
