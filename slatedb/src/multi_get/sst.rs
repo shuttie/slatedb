@@ -16,11 +16,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::try_join_all;
+use log::error;
 use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::task::{JoinError, JoinSet};
 
 use crate::block_iterator::DataBlockIterator;
 use crate::config::MultiGetOptions;
-use crate::db_state::SsTableHandle;
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::filter_policy::NamedFilter;
@@ -31,6 +32,7 @@ use crate::partitioned_keyspace;
 use crate::reader::{ReadTrace, Reader};
 use crate::tablestore::TableStore;
 use crate::types::RowEntry;
+use crate::utils::panic_string;
 
 use super::candidates::SstTarget;
 
@@ -66,12 +68,13 @@ struct KeyBlocks {
 }
 
 /// Reads the SSTs of one batch. It holds only borrows, so a read is a
-/// future on the task of the batch, with no clone of the shared state.
+/// future on the task of the batch, with no clone of the shared state. A
+/// read that must fetch blocks clones what it needs into a [`BlockFetch`].
 #[derive(Clone, Copy)]
 pub(crate) struct SstReader<'a> {
-    table_store: &'a TableStore,
+    table_store: &'a Arc<TableStore>,
     /// Each object store request of the batch holds a permit.
-    requests: &'a Semaphore,
+    requests: &'a Arc<Semaphore>,
     pub(crate) options: &'a MultiGetOptions,
     read_trace: &'a ReadTrace,
     pub(crate) db_stats: &'a DbStats,
@@ -80,7 +83,7 @@ pub(crate) struct SstReader<'a> {
 impl<'a> SstReader<'a> {
     pub(crate) fn new(
         reader: &'a Reader,
-        requests: &'a Semaphore,
+        requests: &'a Arc<Semaphore>,
         options: &'a MultiGetOptions,
         read_trace: &'a ReadTrace,
     ) -> Self {
@@ -143,12 +146,18 @@ impl<'a> SstReader<'a> {
             return Ok(SstEntries { found, index });
         }
         let keys = key_blocks(keys, &index);
-        let blocks = self
-            .read_blocks(&sst.handle, &index, &keys, sst.segment)
-            .await?;
-        let found = self
-            .scan(sst.handle.format_version, &keys, &blocks, filtered)
-            .await?;
+        let fetch = self.cached_blocks(sst, index.clone(), keys, filtered).await;
+        let found = if fetch.runs.is_empty() {
+            // All blocks are in the cache, so the scan runs here.
+            fetch.run().await?
+        } else {
+            // The fetch, the decode, and the scan run on another thread. A
+            // drop of `task` aborts the task.
+            let mut task = JoinSet::new();
+            task.spawn(fetch.run());
+            let joined = task.join_next().await.expect("one task was spawned");
+            joined.map_err(fetch_join_error)??
+        };
         Ok(SstEntries { found, index })
     }
 
@@ -159,28 +168,27 @@ impl<'a> SstReader<'a> {
             .expect("the request semaphore is never closed")
     }
 
-    /// Take the blocks of `keys` from the cache. Merge the block ranges of
-    /// the other blocks into runs, and read all runs in parallel.
-    async fn read_blocks(
+    /// Take the blocks of `keys` from the cache, and merge the block ranges
+    /// of the other blocks into runs. A cache lookup here is cheaper than
+    /// the load path of `read_blocks_using_index` for one block.
+    async fn cached_blocks(
         self,
-        handle: &SsTableHandle,
-        index: &Arc<SsTableIndexOwned>,
-        keys: &[KeyBlocks],
-        segment: Bytes,
-    ) -> Result<BTreeMap<usize, Arc<Block>>, SlateDBError> {
+        sst: SstTarget,
+        index: Arc<SsTableIndexOwned>,
+        keys: Vec<KeyBlocks>,
+        filtered: bool,
+    ) -> BlockFetch {
         let mut needed: Vec<usize> = Vec::new();
-        for key in keys {
+        for key in &keys {
             needed.extend(key.blocks.clone());
         }
         needed.sort_unstable();
         needed.dedup();
 
-        // A cache lookup here is cheaper than the load path of
-        // `read_blocks_using_index` for one block.
         let mut blocks: BTreeMap<usize, Arc<Block>> = BTreeMap::new();
         let mut missing: Vec<usize> = Vec::new();
         for b in needed {
-            match self.table_store.cached_block(handle, index, b).await {
+            match self.table_store.cached_block(&sst.handle, &index, b).await {
                 Some(block) => {
                     blocks.insert(b, block);
                 }
@@ -190,55 +198,103 @@ impl<'a> SstReader<'a> {
 
         let runs = coalesce_runs(
             &missing,
-            |blocks| self.table_store.block_byte_range(handle, index, blocks),
+            |blocks| {
+                self.table_store
+                    .block_byte_range(&sst.handle, &index, blocks)
+            },
             self.options.coalesce_gap_bytes as u64,
             self.options.max_coalesced_bytes as u64,
         );
-        let fetched = try_join_all(runs.iter().map(|run| {
-            let segment = Some(segment.clone());
-            async move {
-                let _permit = self.permit().await;
-                self.table_store
-                    .read_blocks_using_index(
-                        handle,
-                        index.clone(),
-                        run.clone(),
-                        self.options.cache_blocks,
-                        segment,
-                    )
-                    .await
-            }
+        BlockFetch {
+            table_store: self.table_store.clone(),
+            requests: self.requests.clone(),
+            db_stats: self.db_stats.clone(),
+            cache_blocks: self.options.cache_blocks,
+            sst,
+            index,
+            keys,
+            blocks,
+            runs,
+            filtered,
+        }
+    }
+}
+
+/// The rest of one SST read after the cache pass: fetch the missing blocks,
+/// then scan the blocks of each key. It owns its data, so it can run as a
+/// task.
+struct BlockFetch {
+    table_store: Arc<TableStore>,
+    requests: Arc<Semaphore>,
+    db_stats: DbStats,
+    cache_blocks: bool,
+    sst: SstTarget,
+    index: Arc<SsTableIndexOwned>,
+    keys: Vec<KeyBlocks>,
+    /// The blocks from the cache. The fetched blocks join them.
+    blocks: BTreeMap<usize, Arc<Block>>,
+    /// The missing blocks, merged into ranges.
+    runs: Vec<Range<usize>>,
+    /// The SST has filters, for the false positive stats.
+    filtered: bool,
+}
+
+impl BlockFetch {
+    /// Read all runs in parallel, then scan. A key that the filters passed
+    /// and that the SST does not hold is a filter false positive.
+    async fn run(mut self) -> Result<Vec<KeyEntries>, SlateDBError> {
+        let this = &self;
+        let fetched = try_join_all(this.runs.iter().map(|run| async move {
+            let _permit = this
+                .requests
+                .acquire()
+                .await
+                .expect("the request semaphore is never closed");
+            this.table_store
+                .read_blocks_using_index(
+                    &this.sst.handle,
+                    this.index.clone(),
+                    run.clone(),
+                    this.cache_blocks,
+                    Some(this.sst.segment.clone()),
+                )
+                .await
         }))
         .await?;
-
-        for (run, run_blocks) in runs.iter().zip(fetched) {
+        for (run, run_blocks) in self.runs.iter().zip(fetched) {
             for (offset, block) in run_blocks.into_iter().enumerate() {
-                blocks.insert(run.start + offset, block);
+                self.blocks.insert(run.start + offset, block);
             }
         }
-        Ok(blocks)
-    }
 
-    /// Scan the blocks of each key for its entries. A key that the filters
-    /// passed and that the SST does not hold is a filter false positive.
-    async fn scan(
-        self,
-        sst_version: u16,
-        keys: &[KeyBlocks],
-        blocks: &BTreeMap<usize, Arc<Block>>,
-        filtered: bool,
-    ) -> Result<Vec<KeyEntries>, SlateDBError> {
-        let mut found = Vec::with_capacity(keys.len());
-        for key in keys {
-            let entries = scan_key(sst_version, key, blocks).await?;
+        let sst_version = self.sst.handle.format_version;
+        let mut found = Vec::with_capacity(self.keys.len());
+        for key in &self.keys {
+            let entries = scan_key(sst_version, key, &self.blocks).await?;
             if !entries.is_empty() {
                 let idx = key.key.idx;
                 found.push(KeyEntries { idx, entries });
-            } else if filtered {
+            } else if self.filtered {
                 self.db_stats.sst_filter_point_false_positives.increment(1);
             }
         }
         Ok(found)
+    }
+}
+
+/// Convert a failed join of a fetch task into an error. A task is cancelled
+/// when its runtime shuts down.
+fn fetch_join_error(join_err: JoinError) -> SlateDBError {
+    let task_name = "multi_get_block_fetch".to_string();
+    match join_err.try_into_panic() {
+        Ok(panic) => {
+            error!(
+                "multi_get block fetch task panicked [panic={}]",
+                panic_string(&panic)
+            );
+            SlateDBError::BackgroundTaskPanic(task_name)
+        }
+        Err(_) => SlateDBError::BackgroundTaskCancelled(task_name),
     }
 }
 
@@ -439,7 +495,7 @@ mod tests {
             index: Option<Arc<SsTableIndexOwned>>,
             options: MultiGetOptions,
         ) -> Vec<usize> {
-            let requests = Semaphore::new(options.max_fetch_tasks);
+            let requests = Arc::new(Semaphore::new(options.max_fetch_tasks));
             let read_trace = ReadTrace::new(None);
             let db_stats = DbStats::new(&MetricsRecorderHelper::noop());
             let reader = SstReader {

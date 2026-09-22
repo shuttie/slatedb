@@ -14,6 +14,8 @@ mod key;
 mod pipeline;
 mod sst;
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tokio::sync::Semaphore;
 use tracing::Instrument;
@@ -141,7 +143,7 @@ impl Reader {
         // 4. Read. Each open key reads its candidates newest first, in
         //    rounds, until it has a base value or no candidate is left. The
         //    keys do not wait for each other.
-        let requests = Semaphore::new(options.max_fetch_tasks.max(1));
+        let requests = Arc::new(Semaphore::new(options.max_fetch_tasks.max(1)));
         let reader = SstReader::new(self, &requests, options, &read_trace);
         let pipeline = Pipeline::new(reader, &mut key_reads, ssts, max_seq);
         let rounds = pipeline.run().await?;
