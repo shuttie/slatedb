@@ -414,10 +414,12 @@ pub(crate) trait KeyGeneratorSupplier {
                     key_len,
                     key_count, all_keys, "using fixed set key generator"
                 );
+                // One set for all tasks.
+                let keys = FixedSetKeyGenerator::key_set(key_len, key_count, seed);
                 Box::new(move || {
                     let task = next_task.fetch_add(1, Ordering::Relaxed);
                     let generator =
-                        FixedSetKeyGenerator::new(key_len, key_count, seed, task_seed(seed, task));
+                        FixedSetKeyGenerator::from_set(keys.clone(), task_seed(seed, task));
                     if all_keys {
                         Box::new(generator.walk(task as usize, tasks))
                     } else {

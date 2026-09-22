@@ -271,7 +271,8 @@ impl KeyGenerator for RandomKeyGenerator {
 }
 
 pub struct FixedSetKeyGenerator {
-    keys: Vec<Bytes>,
+    /// Shared between the tasks. A set of 10M keys takes about 1 GiB.
+    keys: Arc<Vec<Bytes>>,
     rng: XorShiftRng,
     used_keys: Vec<Bytes>,
     /// The walk over the set, or `None` for random picks. See [`Self::walk`].
@@ -294,11 +295,23 @@ impl FixedSetKeyGenerator {
         set_seed: Option<u64>,
         pick_seed: Option<u64>,
     ) -> Self {
+        let keys = Self::key_set(key_bytes, key_count, set_seed);
+        Self::from_set(keys, pick_seed)
+    }
+
+    /// The key set of `new`. Build it one time and pass it to `from_set` when
+    /// more than one task reads the same set.
+    pub fn key_set(key_bytes: usize, key_count: u64, set_seed: Option<u64>) -> Arc<Vec<Bytes>> {
         let mut random_key_generator = RandomKeyGenerator::new(key_bytes, set_seed);
-        let mut keys = Vec::new();
+        let mut keys = Vec::with_capacity(key_count as usize);
         for _ in 0..key_count {
             keys.push(random_key_generator.next_key());
         }
+        Arc::new(keys)
+    }
+
+    /// A generator over a shared key set. See [`Self::new`].
+    pub fn from_set(keys: Arc<Vec<Bytes>>, pick_seed: Option<u64>) -> Self {
         Self {
             keys,
             rng: rng_from(pick_seed),
@@ -880,7 +893,8 @@ mod tests {
         let tasks = 3;
         let set: BTreeSet<Bytes> = FixedSetKeyGenerator::new(8, key_count, Some(7), None)
             .keys
-            .into_iter()
+            .iter()
+            .cloned()
             .collect();
         let mut walked = Vec::new();
         for task in 0..tasks {
