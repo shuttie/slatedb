@@ -287,6 +287,12 @@ pub(crate) struct BenchmarkDbArgs {
     )]
     pub(crate) all_keys: bool,
 
+    #[arg(
+        long,
+        help = "With --all-keys, a read run picks keys with a Zipf distribution of this exponent instead of a uniform one."
+    )]
+    pub(crate) zipf: Option<f64>,
+
     #[command(subcommand)]
     pub(crate) mode: Option<DbMode>,
 }
@@ -392,6 +398,12 @@ pub(crate) trait KeyGeneratorSupplier {
         false
     }
 
+    /// The Zipf exponent of the read picks of a walk, or `None` for uniform
+    /// picks. See [`FixedSetKeyGenerator::with_zipf`].
+    fn zipf(&self) -> Option<f64> {
+        None
+    }
+
     fn key_gen_supplier(&self) -> Box<dyn Fn() -> Box<dyn KeyGenerator>> {
         let key_len = self.key_len();
         let key_count = self.key_count();
@@ -414,14 +426,22 @@ pub(crate) trait KeyGeneratorSupplier {
                     key_len,
                     key_count, all_keys, "using fixed set key generator"
                 );
-                // One set for all tasks.
+                // One set and one CDF for all tasks.
                 let keys = FixedSetKeyGenerator::key_set(key_len, key_count, seed);
+                let zipf = self
+                    .zipf()
+                    .filter(|_| all_keys)
+                    .map(|s| FixedSetKeyGenerator::zipf_cdf(key_count, s));
                 Box::new(move || {
                     let task = next_task.fetch_add(1, Ordering::Relaxed);
                     let generator =
                         FixedSetKeyGenerator::from_set(keys.clone(), task_seed(seed, task));
                     if all_keys {
-                        Box::new(generator.walk(task as usize, tasks))
+                        let walker = generator.walk(task as usize, tasks);
+                        match &zipf {
+                            Some(cdf) => Box::new(walker.with_zipf(cdf.clone())),
+                            None => Box::new(walker),
+                        }
                     } else {
                         Box::new(generator)
                     }
@@ -462,6 +482,10 @@ impl KeyGeneratorSupplier for BenchmarkDbArgs {
 
     fn all_keys(&self) -> bool {
         self.all_keys
+    }
+
+    fn zipf(&self) -> Option<f64> {
+        self.zipf
     }
 }
 

@@ -277,6 +277,9 @@ pub struct FixedSetKeyGenerator {
     used_keys: Vec<Bytes>,
     /// The walk over the set, or `None` for random picks. See [`Self::walk`].
     walk: Option<Walk>,
+    /// The Zipf CDF over the key ranks, or `None` for uniform picks. See
+    /// [`Self::with_zipf`].
+    zipf: Option<Arc<Vec<f64>>>,
 }
 
 /// A walk over the fixed set. Task `start` of `stride` tasks visits the keys
@@ -317,7 +320,32 @@ impl FixedSetKeyGenerator {
             rng: rng_from(pick_seed),
             used_keys: Vec::new(),
             walk: None,
+            zipf: None,
         }
+    }
+
+    /// The CDF of a Zipf distribution with exponent `s` over `key_count`
+    /// ranks: entry `i` is the probability of a rank at most `i`. Build it one
+    /// time and share it between the tasks.
+    pub fn zipf_cdf(key_count: u64, s: f64) -> Arc<Vec<f64>> {
+        let mut cdf = Vec::with_capacity(key_count as usize);
+        let mut sum = 0.0;
+        for rank in 1..=key_count {
+            sum += (rank as f64).powf(-s);
+            cdf.push(sum);
+        }
+        for c in cdf.iter_mut() {
+            *c /= sum;
+        }
+        Arc::new(cdf)
+    }
+
+    /// Makes `used_key` pick key `i` of the set with the Zipf probability of
+    /// rank `i + 1`. Only a walk uses it. The set is random, so the hot keys
+    /// spread over the whole key space.
+    pub fn with_zipf(mut self, cdf: Arc<Vec<f64>>) -> Self {
+        self.zipf = Some(cdf);
+        self
     }
 
     /// Makes the generator cover the whole set.
@@ -350,7 +378,13 @@ impl KeyGenerator for FixedSetKeyGenerator {
 
     fn used_key(&mut self) -> Bytes {
         if self.walk.is_some() {
-            let index = self.rng.random_range(0..self.keys.len());
+            let index = match &self.zipf {
+                Some(cdf) => {
+                    let u: f64 = self.rng.random();
+                    cdf.partition_point(|&c| c < u).min(self.keys.len() - 1)
+                }
+                None => self.rng.random_range(0..self.keys.len()),
+            };
             return self.keys[index].clone();
         }
         if self.used_keys.is_empty() {
@@ -886,6 +920,20 @@ async fn dump_stats(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn test_zipf_picks_the_first_keys_most() {
+        let key_count = 1000;
+        let cdf = FixedSetKeyGenerator::zipf_cdf(key_count, 1.3);
+        assert!((cdf[cdf.len() - 1] - 1.0).abs() < 1e-9);
+        let mut picker = FixedSetKeyGenerator::new(8, key_count, Some(7), Some(1))
+            .walk(0, 1)
+            .with_zipf(cdf);
+        let first = picker.keys[0].clone();
+        let hits = (0..10_000).filter(|_| picker.used_key() == first).count();
+        // Rank 1 has 1 / H(1000, 1.3) of the mass, about 30 percent.
+        assert!((2_500..3_500).contains(&hits), "hits: {hits}");
+    }
 
     #[test]
     fn test_walk_covers_the_set_one_time() {
