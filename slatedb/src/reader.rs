@@ -1760,13 +1760,13 @@ mod tests {
         vec![l0_value(b"v0", 50, 0), l0_value(b"v1", 60, 1), l0_value(b"v2", 70, 2)],
         None, b"v2", 1, 3 + 2,
     )]
-    // `max_seq` hides the version of wave 1, so wave 2 reads one more SST.
-    #[case::hidden_version_costs_a_wave(
+    // `max_seq` hides the version of round 1, so round 2 reads one more SST.
+    #[case::hidden_version_costs_a_round(
         vec![l0_value(b"v0", 50, 0), l0_value(b"v1", 60, 1), l0_value(b"v2", 70, 2)],
         Some(65), b"v1", 2, 3 + 2 + 2,
     )]
-    // Wave 1 finds a merge operand. It removes the limit, so wave 2 reads
-    // both older SSTs, and there is no wave 3.
+    // Round 1 finds a merge operand. It removes the limit, so round 2 reads
+    // both older SSTs, and there is no round 3.
     #[case::operand_removes_the_limit(
         vec![l0_value(b"v0", 50, 0), l0_merge(b"+1", 60, 1), l0_merge(b"+2", 70, 2)],
         None, b"v0+1+2", 2, 3 + 2 + 2 * 2,
@@ -1776,7 +1776,7 @@ mod tests {
         #[case] entries: Vec<TestEntry>,
         #[case] max_seq: Option<u64>,
         #[case] expected: &'static [u8],
-        #[case] expected_waves: i64,
+        #[case] expected_rounds: i64,
         #[case] expected_gets: usize,
     ) -> Result<(), SlateDBError> {
         let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
@@ -1794,8 +1794,8 @@ mod tests {
 
         let value = values[0].as_ref().and_then(|entry| entry.value.as_bytes());
         assert_eq!(value, Some(Bytes::from_static(expected)));
-        let waves = lookup_metric_with_labels(&recorder, crate::db_stats::MULTI_GET_ROUNDS, &[]);
-        assert_eq!(waves, Some(expected_waves));
+        let rounds = lookup_metric_with_labels(&recorder, crate::db_stats::MULTI_GET_ROUNDS, &[]);
+        assert_eq!(rounds, Some(expected_rounds));
         assert_eq!(recording.recorded_get_ranges(false).len(), expected_gets);
         Ok(())
     }

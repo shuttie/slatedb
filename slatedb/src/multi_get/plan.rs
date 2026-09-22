@@ -121,9 +121,8 @@ impl Plan {
         plan
     }
 
-    /// Apply the filters that a wave loaded for the UNKNOWN SST `sst`. An open
-    /// key that they reject loses this candidate. The other open keys become
-    /// POSITIVE.
+    /// Apply the loaded filters of the UNKNOWN SST `sst`. An open key that
+    /// they reject loses this candidate. The other open keys become POSITIVE.
     pub(crate) fn apply_filters(
         &mut self,
         sst: usize,
@@ -157,9 +156,9 @@ impl Plan {
     }
 }
 
-/// How many candidates of one key, newest first, a wave reads. The walk stops
-/// after `limit` POSITIVE SSTs. An UNKNOWN SST is free, because the wave only
-/// loads its filter. A limit of 0 acts as 1.
+/// How many candidates of one key, newest first, one round reads. The walk
+/// stops after `limit` POSITIVE SSTs. An UNKNOWN SST is free, because the
+/// pick only loads its filter. A limit of 0 acts as 1.
 fn pick(candidates: &[Candidate], limit: usize) -> usize {
     let mut left = limit.max(1);
     for (i, candidate) in candidates.iter().enumerate() {
@@ -173,14 +172,14 @@ fn pick(candidates: &[Candidate], limit: usize) -> usize {
     candidates.len()
 }
 
-/// The pick of wave 1: down to the first POSITIVE SST. A key with a merge
-/// operand needs its base value, so it has no limit.
+/// The first pick of a key: down to the first POSITIVE SST. A key with a
+/// merge operand needs its base value, so it has no limit.
 pub(crate) fn pick_first(candidates: &[Candidate], has_operand: bool) -> usize {
     pick(candidates, if has_operand { usize::MAX } else { 1 })
 }
 
-/// The pick of each later wave: `lookahead` POSITIVE SSTs, as `get` does
-/// after its first miss.
+/// Each later pick of a key: `lookahead` POSITIVE SSTs, as `get` does after
+/// its first miss.
 pub(crate) fn pick_next(candidates: &[Candidate], has_operand: bool, lookahead: usize) -> usize {
     pick(candidates, if has_operand { usize::MAX } else { lookahead })
 }
@@ -595,20 +594,20 @@ mod tests {
     }
 
     #[rstest]
-    #[case::first_wave_reads_one(true, false, 4, 1)]
-    #[case::first_wave_with_operand_reads_all(true, true, 4, 6)]
-    #[case::later_wave_reads_lookahead(false, false, 4, 4)]
-    #[case::later_wave_with_lookahead_1(false, false, 1, 1)]
-    #[case::later_wave_with_lookahead_0(false, false, 0, 1)]
-    #[case::later_wave_with_operand_reads_all(false, true, 1, 6)]
-    fn should_limit_each_wave(
-        #[case] first_wave: bool,
+    #[case::first_pick_reads_one(true, false, 4, 1)]
+    #[case::first_pick_with_operand_reads_all(true, true, 4, 6)]
+    #[case::later_pick_reads_lookahead(false, false, 4, 4)]
+    #[case::later_pick_with_lookahead_1(false, false, 1, 1)]
+    #[case::later_pick_with_lookahead_0(false, false, 0, 1)]
+    #[case::later_pick_with_operand_reads_all(false, true, 1, 6)]
+    fn should_limit_each_pick(
+        #[case] first_pick: bool,
         #[case] has_operand: bool,
         #[case] lookahead: usize,
         #[case] expected: usize,
     ) {
         let list = candidates(&[P; 6]);
-        let picked = match first_wave {
+        let picked = match first_pick {
             true => pick_first(&list, has_operand),
             false => pick_next(&list, has_operand, lookahead),
         };
