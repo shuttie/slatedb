@@ -1655,7 +1655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_get_drop_aborts_sst_tasks() -> Result<(), SlateDBError> {
+    async fn test_multi_get_drop_cancels_sst_reads() -> Result<(), SlateDBError> {
         let recording = Arc::new(RecordingObjectStore::new(Arc::new(InMemory::new())));
         let gated = Arc::new(GatedObjectStore::new(recording.clone()));
         let mut test_db_state = TestDbState::with_object_store(gated.clone());
@@ -1672,7 +1672,7 @@ mod tests {
         let keys = [b"l0_key".as_ref(), b"sr_key".as_ref()];
         let options = MultiGetOptions::default();
         let batch = reader.multi_get_with_options(&keys, &options, &test_db_state, None, None);
-        // The first request of each SST task waits at the gate. Then the batch
+        // The filter load of each SST waits at the gate. Then the batch
         // future drops.
         tokio::select! {
             biased;

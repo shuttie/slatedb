@@ -933,17 +933,6 @@ impl TableStore {
         )
     }
 
-    /// Returns the index of an SST if it is in the cache. Never loads.
-    pub(crate) async fn cached_index(
-        &self,
-        handle: &SsTableHandle,
-    ) -> Option<Arc<SsTableIndexOwned>> {
-        let cache = self.cache_for_reads()?;
-        let cache_key = (handle.id, handle.info.index_offset).into();
-        let entry = cache.get_index(&cache_key).await.unwrap_or(None)?;
-        entry.sst_index()
-    }
-
     /// Returns one block of an SST if it is in the cache. Never loads.
     pub(crate) async fn cached_block(
         &self,

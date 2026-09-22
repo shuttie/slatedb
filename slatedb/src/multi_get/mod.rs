@@ -1,19 +1,21 @@
 //! Batched point reads (`multi_get`, RFC 0035).
 //!
-//! - [`plan`]: which SSTs can hold which keys. Memory only.
+//! - [`key`]: the keys of the batch and the read state of each one.
+//! - [`candidates`]: which SSTs can hold which keys. Memory only.
 //! - [`sst`]: how one SST is read for its keys.
 //! - [`pipeline`]: the read phase. Each key reads its SSTs newest first,
 //!   and no key waits for the reads of another key.
 //! - This module: the orchestrator. It reads the write batch and the
-//!   memtables, builds the plan, runs the pipeline, and resolves each key
-//!   with the components of the single-key `get` path.
+//!   memtables, lists the candidate SSTs, runs the pipeline, and resolves
+//!   each key with the components of the single-key `get` path.
 
+mod candidates;
 mod key;
 mod pipeline;
-mod plan;
 mod sst;
 
 use bytes::Bytes;
+use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 use crate::batch::{WriteBatch, WriteBatchIterator};
@@ -25,12 +27,12 @@ use crate::iter::{IterationOrder, RowEntryIterator, VecRowIterator};
 use crate::mem_table::KVTable;
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorRequiredIterator};
 use crate::reader::{DbStateReader, ReadTrace, Reader};
-use crate::sst_iter::SstIteratorOptions;
 use crate::types::RowEntry;
 
-use key::KeyRead;
+use candidates::{candidate_ssts, Filters};
+use key::{BatchKeys, KeyRead};
 use pipeline::Pipeline;
-use plan::{candidate_ssts, BatchKeys, Plan};
+use sst::SstReader;
 
 impl Reader {
     /// Batched point lookup: resolve many keys against a single consistent
@@ -123,36 +125,25 @@ impl Reader {
             read_memtable_layer(&imm.table(), &mut key_reads, max_seq, &read_trace).await;
         }
 
-        // 3. Plan: the SSTs that can hold each open key. Only filters that are
-        //    in the cache take part, so the plan sends no request.
-        let mut ssts = candidate_ssts(db_state.core(), &key_reads).await;
+        // 3. The SSTs that can hold each open key. The walk reads only the
+        //    manifest.
+        let mut ssts = candidate_ssts(db_state.core(), &mut key_reads).await;
+        // Filters in the cache are loaded now, so a key checks a warm SST
+        // with no load and no extra turn of the read loop.
         for sst in ssts.iter_mut() {
-            sst.filters = self.table_store.cached_filters(&sst.view.sst).await;
+            if let Some(filters) = self.table_store.cached_filters(&sst.target.handle).await {
+                sst.filters = Filters::Loaded(filters);
+            }
             // Keep cached lookups cooperative.
             tokio::task::coop::consume_budget().await;
-        }
-        let mut plan = Plan::new(
-            ssts,
-            key_reads.len(),
-            &options.filter_context,
-            Some(&self.db_stats),
-        );
-        // A key with no candidates has nothing to read.
-        for (key, candidates) in key_reads.iter_mut().zip(&plan.candidates) {
-            key.done |= candidates.is_empty();
         }
 
         // 4. Read. Each open key reads its candidates newest first, in
         //    rounds, until it has a base value or no candidate is left. The
         //    keys do not wait for each other.
-        let pipeline = Pipeline::new(
-            self,
-            &mut plan,
-            &mut key_reads,
-            max_seq,
-            options,
-            &read_trace,
-        );
+        let requests = Semaphore::new(options.max_fetch_tasks.max(1));
+        let reader = SstReader::new(self, &requests, options, &read_trace);
+        let pipeline = Pipeline::new(reader, &mut key_reads, ssts, max_seq);
         let rounds = pipeline.run().await?;
         self.db_stats.multi_get_rounds.increment(rounds);
         read_trace.read_span().record("rounds", rounds);
@@ -212,16 +203,6 @@ impl Reader {
             Some(entry) if entry.value.is_tombstone() => None,
             other => other,
         })
-    }
-}
-
-/// The read options of one SST of the batch.
-fn sst_options(options: &MultiGetOptions, segment: &Bytes) -> SstIteratorOptions {
-    SstIteratorOptions {
-        cache_blocks: options.cache_blocks,
-        filter_context: options.filter_context.clone(),
-        segment: Some(segment.clone()),
-        ..SstIteratorOptions::default()
     }
 }
 

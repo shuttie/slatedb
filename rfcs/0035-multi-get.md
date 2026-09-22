@@ -138,23 +138,23 @@ to repeat this work for each key:
 
 - The plan phase uses only things which are kept in memory. It answers what it can from the write batch
   and the memtables. For each key that is still open, it builds the list of
-  SSTs that can hold the key, newest first.
-- The read phase fetches data in rounds, per key. In its first round, each
-  open key reads only the newest SST that can hold it. A key goes to its
-  next round only when that SST did not answer it. The keys do not wait for
-  each other: when the read of one SST returns, its keys make their next
-  pick at once.
+  SSTs that can hold the key, newest first. It does not look at filters.
+- The read phase fetches data in rounds, per key. A key walks its list and
+  checks the filter of each SST when it reaches it, as `get` does. In its
+  first round, each open key reads only the newest SST whose filter passes
+  it. A key goes to its next round only when that SST did not answer it.
+  The keys do not wait for each other: when the read of one SST returns,
+  its keys make their next pick at once.
 
 The motivation of such iterative design is that it's not possible to build a full deterministic plan
 of the multi_get batch read.
 
 ```text
-keys --> PLAN (memory only) ------------> READ (object store)
-         1. state view, max_seq            round 1: newest candidate per key
-         2. dedup, sort                    round 2: a key that is still open
-         3. write batch, memtables         ...
-         4. group keys per SST
-         5. probe the cached filters
+keys --> PLAN (memory only) ------------> READ (cache or object store)
+         1. state view, max_seq            round 1: filters, then the newest
+         2. dedup, sort                             candidate that passes
+         3. write batch, memtables         round 2: a key that is still open
+         4. candidate SSTs per key         ...
 ```
 
 The unit of work is the SST and not the key. One SST serves all of its keys
@@ -273,35 +273,25 @@ for sst in view.l0:                       # an L0 SST can hold any key
     for key in open_keys inside sst.key_range:
         candidates[key].push(sst)
 for run in view.sorted_runs:              # a run has one SST per key
-    for (key, sst) in merge_join(open_keys, run.ssts):
-        candidates[key].push(sst)
-
-# 4. Filters: use what is in the cache, never load
-for sst in all SSTs in candidates:
-    filter = cache.peek_filter(sst)       # no object store request
-    for key in keys that have sst as a candidate:
-        if filter is not in the cache:    mark (key, sst) as UNKNOWN
-        elif filter.might_match(key):     mark (key, sst) as POSITIVE
-        else:                             remove sst from candidates[key]
-
-# 5. A key with no candidates and no operands is absent
-for key in open_keys:
-    if candidates[key] is empty and operands[key] is empty:
-        results[key] = None
+    for key in open_keys:
+        for sst in run.ssts_covering(key): # binary search, as in get
+            candidates[key].push(sst)
 ```
 
-With segments, steps 3 and 4 run inside the segment that covers the key.
+With segments, step 3 runs inside the segment that covers the key.
 
 The reasons behind the steps:
 
-- The keys are copied into `Bytes` and sorted. The copy lets spawned tasks
-  share the keys with no borrow of the input slice. The sort turns N binary
-  searches in a sorted run into one forward pass.
+- The keys are copied into `Bytes`, sorted, and deduplicated. A duplicate
+  key is read one time.
 - The plan phase builds no iterators. A `get` builds one iterator per memtable
   and per candidate SST before its first lookup.
-- The plan phase never loads a filter. A `get` reads the filter of an older
-  SST only when the newer SSTs did not answer. A batch that loads all filters
-  up front sends more requests than a loop when the cache is cold.
+- The plan phase does not look at filters. A `get` checks the filter of an
+  older SST only when the newer SSTs did not answer. A batch that loads all
+  filters up front sends more requests than a loop when the cache is cold.
+- The binary search per key and run is the one that `get` uses. A forward
+  pass over sorted keys saves little next to the reads, and it needs a
+  second copy of the search.
 - The loops over the keys yield to the runtime at a fixed interval, with
   `consume_budget`. This holds for the plan phase and for each key pass of
   the read phase. A `get` yields one time per entry. A loop over thousands of keys
@@ -316,28 +306,25 @@ when no read is in flight.
 
 ```text
 loaded = {}                               # filters and indexes of this batch
-tasks  = {}                               # one JoinSet for the whole batch
+events = {}                               # futures of loads and reads
 
 schedule(key):                            # the key is open and idle
-    picked = pick_next(candidates[key])   # see the rules below
-    if picked has an UNKNOWN sst:
-        for sst in these UNKNOWN ssts, not yet loading:
-            spawn load_filter(sst)        # -> Filters event
-        mark the key as waiting
-        return
-    remove picked from candidates[key]
-    inflight[key] = picked                # newest first
-    for sst in picked:
-        ready[sst].push(key)              # group the keys per SST
+    pick = pick_next(key)                 # see the rules below
+    if pick is Done:                      # no candidate is left
+        the key is done
+    if pick is Load(ssts):                # filters that are not loaded
+        for sst in ssts:
+            add the key to the waiters of sst
+            if no load of sst is in flight:
+                events.push(load_filter(sst))   # -> Filters event
+    if pick is Read(ssts):                # newest first
+        inflight[key] = ssts
+        for sst in ssts:
+            ready[sst].push(key)          # group the keys per SST
 
-flush():                                  # ready -> cache pass -> tasks
-    while ready is not empty:
-        for (sst, keys) in take(ready):
-            found = read_from_cache(sst, keys)     # inline, no I/O
-            misses = keys - keys in found
-            if misses is not empty:
-                spawn read_sst(sst, misses)       # -> Read event
-            arrive(sst, keys - misses, found)     # can call schedule
+start_reads():                            # at the end of each turn
+    for (sst, keys) in take(ready):
+        events.push(read_sst(sst, keys))  # -> Read event
 
 arrive(sst, keys, found):
     for key in keys:
@@ -356,23 +343,23 @@ arrive(sst, keys, found):
 
 run():
     for key in open_keys: schedule(key)
-    flush()
-    for event in tasks, as each one ends:
+    start_reads()
+    for event in events, as each one ends:
         Filters(sst, filter):             # kept in loaded
-            for key in open keys of sst:
-                mark (key, sst) as POSITIVE, or remove sst from candidates[key]
-            for key in waiting keys: schedule(key)
+            for key in the waiters of sst:
+                if the key waits for no other load: schedule(key)
         Read(sst, keys, found):
             arrive(sst, keys, found)
-        flush()
+        start_reads()
 
 
-read_sst(sst, keys):                      # runs as a spawned task
-    index  = load_index(sst)              # kept in loaded
+read_sst(sst, keys):                      # a future on the batch task
+    index  = load_index(sst)              # cache, or kept in loaded
     blocks = the block of each key, from the index
     ranges = merge_adjacent(blocks)       # coalesce_gap_bytes
     for range in ranges, all in parallel: # not one after the other
-        data = GET range                  # semaphore: max_fetch_tasks
+        data = read range                 # cache, or GET under the
+                                          # semaphore: max_fetch_tasks
         for key in keys inside range:
             seek the key, collect its entries
 ```
@@ -390,13 +377,13 @@ Why an event loop and not a loop of steps over all keys:
   holds as before. On a 10M key data set with S3 latency, the lockstep
   version was 25 to 40 percent slower than the loop of gets. The event loop
   is the fix.
-- The cached case does not change. A cache hit is handled inline in `flush`,
-  with no task, and a batch with all blocks in the cache spawns nothing.
+- The loop spawns no task. Each load and read is a future on the task of
+  the batch. A cache hit resolves when the loop polls it, with no I/O.
 
 Two limits of the loop:
 
-- Two tasks of one SST can overlap, when its keys become ready at different
-  times. Each task reads the index when the meta cache has none. A loop of
+- Two reads of one SST can overlap, when its keys become ready at different
+  times. Each read loads the index when the meta cache has none. A loop of
   gets reads it per key, so goal 3 still holds.
 - The loaded filters and indexes are kept per batch, so a key that reads on
   after another key of the same SST sends no metadata request again.
@@ -414,35 +401,43 @@ The rule is a trade between requests and round trips:
 - All SSTs at once need one round trip, but they download blocks of old
   versions that the newest SST already answers.
 
-`pick_next` reads as few SSTs as it can, with two exceptions:
+`pick_next` reads as few SSTs as it can, with two exceptions. It checks the
+filter of each SST that it walks past, one time per key and SST:
 
 ```text
-pick_next(candidates):                    # newest first
+pick_next(key):                           # candidates newest first
     limit = 1 if this is the first round of the key else options.lookahead
     if the key has a merge operand:
         limit = no limit                  # exception 2
-    picked = []
-    for sst in candidates:
-        picked.push(sst)
-        if sst is POSITIVE:               # exception 1: UNKNOWN is free
+    load, walked = [], []
+    for sst in candidates[key], while limit > 0:
+        if the filter of sst is not loaded:
+            load.push(sst)                # exception 1: free
+        elif the filter rejects the key:
+            remove sst from candidates[key]
+        else:                             # the filter passes the key
+            walked.push(sst)
             limit -= 1
-        if limit == 0:
-            break
-    return picked
+    if load is not empty: return Load(load)
+    if walked is empty:   return Done
+    remove walked from candidates[key]
+    return Read(walked)                   # with the loads that it passed
 ```
 
 An example for one key K with three candidates. A is a new L0 SST, and B and C
 are SSTs of two sorted runs:
 
 ```text
-candidates of K, newest first:   A          B          C
-filter state from the plan:      UNKNOWN    POSITIVE   POSITIVE
+candidates of K, newest first:   A              B              C
+filter:                          not loaded     in cache,      in cache,
+                                                passes K       passes K
 
-round 1 picks A and B, and stops at the first POSITIVE:
-    A: load the filter -> negative, A leaves the list
+pick 1 walks A and B, and stops at the first pass:
+    A: load the filter, then pick again
+pick 2, if the filter of A rejects K: A leaves the list
     B: read one block  -> K is there, done
 
-if the filter of A is positive, A is the first POSITIVE:
+if the filter of A passes K, A is the first pass:
     A: read one block, and B waits for round 2
 
 round 2 runs only if B was a false positive:
@@ -451,19 +446,21 @@ round 2 runs only if B was a false positive:
 
 The reasons:
 
-- The first round stops at the first POSITIVE SST. A key with frequent updates has old
-  versions in older SSTs, and their filters are right to answer "present". C
-  in the example can hold an old version of K. To read it is a waste, because
-  B has the newer one.
-- Exception 1: an UNKNOWN SST does not count. Its filter is not in the cache,
-  so the batch must load it first, and the answer is "negative" 99 times out
-  of 100. The common case is a new L0 SST that a `DbReader` has never seen.
-  This SST is the newest candidate of each key of the batch. If it counted,
-  the first round only loaded one filter, and each new L0 SST cost one more
-  round trip. Only the filter load is free. The key loads the filters of its
-  UNKNOWN SSTs first, then picks again, and an SST that passes counts as
-  POSITIVE. So a cold batch reads no block of a shadowed version. The price is at most one filter load
-  per uncached SST above the requests of a `get` loop.
+- The first round stops at the first SST whose filter passes the key. A key
+  with frequent updates has old versions in older SSTs, and their filters are
+  right to answer "present". C in the example can hold an old version of K.
+  To read it is a waste, because B has the newer one.
+- Exception 1: an SST with no loaded filter does not count. The batch must
+  load its filter first, and the answer is "negative" 99 times out of 100.
+  The common case is a new L0 SST that a `DbReader` has never seen. This SST
+  is the newest candidate of each key of the batch. If it counted, the first
+  round only loaded one filter, and each new L0 SST cost one more round trip.
+  Only the filter load is free. The key loads the filters that it walks
+  past, then picks again. So a cold batch reads no block of a shadowed
+  version. The price is at most one filter load per uncached SST above the
+  requests of a `get` loop.
+- A filter in the cache is a load too, but it sends no request. It costs
+  one turn of the event loop before the key reads.
 - Exception 2: a merge operand removes the limit. The key needs its base
   value, so it must read each SST down to the base in any case. A counter
   with operands in 10 SSTs takes 2 rounds and not 4.
@@ -480,47 +477,32 @@ How many rounds a key takes:
 - The number of rounds depends on the depth of the tree and not on the batch
   size.
 
-#### How one SST is read: the cache first, then a task
+#### How one SST is read
 
-In short: for each SST that is ready, the batch first answers the keys whose
-data is in the block cache. It does this on the task of the caller, with no I/O.
-Only the keys that miss go to a spawned task, which reads from the object
-store.
+In short: one read per SST and turn does the whole chain for its keys:
+index, block reads, and seeks. It is a future on the task of the batch. The
+index and the blocks come from the cache when they are there, so a warm SST
+sends no request.
 
-```text
-(sst, keys) --> read_from_cache --> hits:   entries, right now
-                      |
-                      +-----------> misses: spawn read_sst --> entries, later
-```
-
-`read_from_cache`, the cheap path:
-
-- It needs the index and the block of a key in the block cache. If one of them
-  is absent, the key is a miss.
-- It never sends an object store request.
-- Hot keys are the reason for it. With a Pareto-style skew, most blocks of a
-  batch are in the cache. A spawned task for them is pure overhead.
-
-`read_sst`, the I/O path:
-
-- One task per SST does the whole chain for its keys: index, block reads, and
-  seeks. The filter is there before the task starts, from the cache or from
-  the filter load of the key.
-- The tasks run in parallel on the runtime. The decode work of a large batch
-  does not pile up on the task of the caller.
-- Two keys in one block cause one read. The task reuses
-  `read_blocks_using_index` for the block reads.
-- The task sends the GETs of all its ranges at the same time. A batch with 40
+- The filter is loaded before the read starts. A read gets only the keys
+  that the filter passed.
+- There is one path for warm and cold data. `read_index` and
+  `read_blocks_using_index` of the `TableStore` check the cache first, as
+  they do for `get`. A cached block costs no GET, also inside a merged range.
+- Two keys in one block cause one read.
+- The read sends the GETs of all its ranges at the same time. A batch with 40
   scattered blocks in one SST takes one round trip and not 40.
-- With `cache_blocks: false`, the task reads from the cache but does not fill
-  it, as `get` does.
+- With `cache_blocks: false`, the read uses the cache but does not fill it,
+  as `get` does.
 
 Limits and cleanup:
 
-- One semaphore per batch bounds the object store requests of all tasks
+- One semaphore per batch bounds the object store requests of all reads
   (`max_fetch_tasks`).
-- The tasks live in a `JoinSet`. If the caller drops the future of the batch,
-  the `JoinSet` aborts them.
+- The reads are futures, not tasks. If the caller drops the future of the
+  batch, the reads and their requests are dropped with it.
+- The decode of blocks runs on the task of the batch, not on many threads.
+  See [Spawned tasks per SST](#spawned-tasks-per-sst-with-a-cache-pass).
 
 `loaded`, the memory of the batch:
 
@@ -553,7 +535,7 @@ There is no second copy of these rules, so the results cannot drift from
 ### Failure handling
 
 - An error in a filter, index, or block read fails the batch with that error.
-- The `JoinSet` aborts the other tasks.
+- The other loads and reads of the batch are dropped.
 - There are no partial results.
 - A retry of the batch is safe. `multi_get` has no side effects except cache
   fills.
@@ -621,7 +603,8 @@ errors as a `get`.
 - [x] Indexing (bloom filters, metadata)
 - [ ] SST format or block format
 
-- The plan phase reads filters from the block cache and never loads them.
+- A key loads the filter of an SST only when its walk reaches that SST, as
+  `get` does. The load goes through the cache.
 - The read phase fills the cache as `get` does, and it respects
   `cache_blocks`.
 - The batch reads each filter and index one time per SST, not one time per
@@ -646,7 +629,8 @@ with an NVMe disk. Keys of 8 bytes, values of 64 bytes, all keys read at
 random, one reader task, batches of 100 keys, `lookahead` 4. The three
 readers: `seq` is a loop of `get`, `concurrent` is 100 `get` calls in
 flight at once, `multi-get` is one batch. The numbers are the last window
-of a 60 or 120 second run.
+of a 60 or 120 second run. They come from v3, with spawned tasks and a
+cache pass. A rerun for v4 is open.
 
 **Reads from RAM.** Local disk, block cache 2 GiB for 1M rows, 4 GiB for
 10M, 16 GiB for 100M. All blocks are cached after the warm-up, so this
@@ -666,7 +650,7 @@ measures the CPU cost per key.
 
 A batch is 2 to 3 times faster than a loop of `get` per key. The gain is
 the per key overhead that a batch pays one time: the snapshot, the
-memtable walk, the plan, and the task per SST.
+memtable walk, the plan, and the read per SST.
 
 **Reads with object store latency.** The 10M dataset with a delay profile
 in the object store client, both from measured GET latencies: `s3` (p50
@@ -768,15 +752,15 @@ A default body can avoid the break. See [Open Questions](#open-questions).
 returns for that key on the same snapshot. The tests reuse the tools that
 SlateDB already has.
 
-- Unit tests: the plan phase, `pick_next`, and `read_sst`, as `rstest` tables
-  next to the code.
+- Unit tests: the candidate walk, the pick of a key, the arrival of reads,
+  and the read of one SST, as `rstest` tables next to the code.
 - Integration tests: one differential test that compares a batch with a `get`
   loop. The fixture follows `tests/scan_model.rs` and forces a compaction, so
   the keys spread over L0 and sorted runs.
 - Request count tests: a counting object store proves goal 3. The batch must
   send no more GETs than the loop, with a warm and with a cold cache.
 - Fault-injection tests: a failed block read fails the batch, and a dropped
-  future leaves no running tasks.
+  future leaves no request in flight.
 - Deterministic simulation tests: the `slatedb-dst` workload gets a `MultiGet`
   operation that checks each slot, as `verify_get` does.
 - Formal methods verification: none.
@@ -880,9 +864,37 @@ read before the next pick. This was the second version of this RFC.
 
 #### Load all filters in the plan phase
 
-- For: no UNKNOWN state, and a simpler `pick_next`.
+- For: no filter loads in the read phase, and a simpler `pick_next`.
 - Against: with a cold cache, it sends more requests than a loop and breaks
   goal 3. RocksDB also probes each filter only when the walk reaches the file.
+
+#### Use cached filters in the plan phase
+
+Probe the cache for the filter of each candidate SST before the read phase,
+and mark each (key, SST) pair as UNKNOWN or POSITIVE. This was v3 of this
+RFC.
+
+- For: a warm key reads one turn of the event loop earlier.
+- Against: filters live in three places: the cache probe, the plan, and the
+  loads of the read phase. The walk of a key checks each filter anyway, so
+  one lazy check covers the warm and the cold case.
+- Against: the batch probes the filters of SSTs that no key reaches, and it
+  counts filter stats for them.
+
+#### Spawned tasks per SST, with a cache pass
+
+Answer the keys whose blocks are cached inline, and send the misses to one
+spawned task per SST in a `JoinSet`. This was v3 of this RFC.
+
+- For: the decode of the blocks of a large cold batch runs on many threads.
+- Against: two read paths for one SST, one for the cache and one for the
+  object store, with a split into hits and misses between them. The
+  `TableStore` already serves cache hits in `read_index` and
+  `read_blocks_using_index`.
+- Against: a task must own its data, so each read copies the table store,
+  the semaphore, the options, the trace, and the stats.
+- The benchmark decides. If a batch that reads from RAM is more than about 5
+  percent slower with futures, only the decode moves to a task.
 
 ### Smaller choices
 
@@ -944,3 +956,5 @@ read before the next pick. This was the second version of this RFC.
 * v2: (21.09.2026) major update
 * v3: (22.09.2026) the read phase is an event loop, not a loop of steps
 * v3.1: (22.09.2026) measured numbers in Performance & Cost
+* v4: (22.09.2026) filters are checked when a key reaches an SST, and the
+  reads are futures on the batch task with one path for warm and cold data

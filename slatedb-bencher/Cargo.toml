@@ -23,6 +23,7 @@ clap = { workspace = true, features = ["derive"] }
 chrono = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 object_store = { workspace = true }
+pprof = { version = "0.14.0", features = ["flamegraph"] }
 rand = { workspace = true }
 rand_xorshift = { workspace = true }
 slatedb = { workspace = true, features = ["aws", "azure", "bencher", "wal_disable", "foyer", "zstd"] }

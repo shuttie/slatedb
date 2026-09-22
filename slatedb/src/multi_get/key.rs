@@ -1,15 +1,61 @@
-//! The read state of one unique key of a `multi_get` batch.
+//! The keys of a `multi_get` batch and the read state of each one.
 
 use bytes::Bytes;
 
 use crate::types::{RowEntry, ValueDeletable};
 
-use super::plan::{pick_first, pick_next, Candidate};
+/// The keys of a batch: sorted, with no duplicates.
+pub(crate) struct BatchKeys {
+    pub(crate) keys: Vec<Bytes>,
+    /// For each input position, the index of its key in `keys`.
+    pub(crate) slots: Vec<usize>,
+}
+
+impl BatchKeys {
+    pub(crate) fn new<K: AsRef<[u8]>>(input: &[K]) -> Self {
+        let mut order: Vec<usize> = (0..input.len()).collect();
+        order.sort_unstable_by(|&a, &b| input[a].as_ref().cmp(input[b].as_ref()));
+        let mut keys: Vec<Bytes> = Vec::new();
+        let mut slots = vec![0; input.len()];
+        for i in order {
+            let key = input[i].as_ref();
+            if keys.last().is_none_or(|last| last.as_ref() != key) {
+                keys.push(Bytes::copy_from_slice(key));
+            }
+            slots[i] = keys.len() - 1;
+        }
+        Self { keys, slots }
+    }
+
+    pub(crate) fn position(&self, key: &[u8]) -> Option<usize> {
+        self.keys.binary_search_by(|k| k.as_ref().cmp(key)).ok()
+    }
+}
+
+/// One SST that can hold a key.
+#[derive(Debug)]
+struct Candidate {
+    /// Index into the SSTs of the batch.
+    sst: usize,
+    /// The filters of the SST passed the key.
+    passed: bool,
+}
+
+/// The next step of a key. See [`KeyRead::pick`].
+#[derive(Debug, PartialEq)]
+pub(crate) enum Pick {
+    /// Load the filters of these SSTs, then pick again.
+    Load(Vec<usize>),
+    /// Read these SSTs, newest first.
+    Read(Vec<usize>),
+    /// No candidate is left.
+    Done,
+}
 
 /// One SST of the current pick of a key.
 #[derive(Debug)]
 struct Inflight {
-    /// Index into [`super::plan::Plan::ssts`].
+    /// Index into the SSTs of the batch.
     sst: usize,
     /// The entries of the SST for the key, once its read arrived.
     entries: Option<Vec<RowEntry>>,
@@ -25,11 +71,14 @@ pub(crate) struct KeyRead {
     pub(crate) acc: Vec<RowEntry>,
     /// The key has a base value, or it has nothing left to read.
     pub(crate) done: bool,
-    /// How many picks the key made.
+    /// The SSTs that can hold the key and that it did not read yet, newest
+    /// first.
+    candidates: Vec<Candidate>,
+    /// How many reads the key sent.
     pub(crate) rounds: u64,
-    /// The pick has an UNKNOWN SST. The key waits for its filter load.
-    pub(crate) waiting: bool,
-    /// The SSTs of the current pick, newest first.
+    /// The number of filter loads that the key waits for.
+    pub(crate) waiting: usize,
+    /// The SSTs of the current read, newest first.
     inflight: Vec<Inflight>,
 }
 
@@ -40,10 +89,21 @@ impl KeyRead {
             wb: Vec::new(),
             acc: Vec::new(),
             done: false,
+            candidates: Vec::new(),
             rounds: 0,
-            waiting: false,
+            waiting: 0,
             inflight: Vec::new(),
         }
+    }
+
+    /// Add an SST that can hold the key. The SSTs come newest first.
+    pub(crate) fn add_candidate(&mut self, sst: usize) {
+        self.candidates.push(Candidate { sst, passed: false });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn candidate_ssts(&self) -> Vec<usize> {
+        self.candidates.iter().map(|c| c.sst).collect()
     }
 
     /// Add one entry of the write batch. A base value resolves the key.
@@ -76,18 +136,58 @@ impl KeyRead {
         !self.wb.is_empty() || !self.acc.is_empty()
     }
 
-    /// How many candidates the next pick reads, newest first.
-    pub(crate) fn pick(&self, candidates: &[Candidate], lookahead: usize) -> usize {
-        match self.rounds {
-            0 => pick_first(candidates, self.has_operand()),
-            _ => pick_next(candidates, self.has_operand(), lookahead),
+    /// Walk the candidates newest first and pick the next step, as `get`
+    /// does. The first read takes one SST whose filters pass the key, and
+    /// each later read takes `lookahead` of them. A key with a merge operand
+    /// needs its base value, so it has no limit.
+    ///
+    /// `filter` says if the filters of an SST pass the key, or `None` when
+    /// they are not loaded. An SST with no loaded filters does not count
+    /// against the limit, because the pick only loads its filters. An SST
+    /// whose filters reject the key leaves the candidates.
+    pub(crate) fn pick(
+        &mut self,
+        lookahead: usize,
+        mut filter: impl FnMut(usize, &Bytes) -> Option<bool>,
+    ) -> Pick {
+        let mut left = match (self.has_operand(), self.rounds) {
+            (true, _) => usize::MAX,
+            (false, 0) => 1,
+            (false, _) => lookahead.max(1),
+        };
+        let mut load = Vec::new();
+        let mut end = 0;
+        while end < self.candidates.len() && left > 0 {
+            let candidate = &mut self.candidates[end];
+            if !candidate.passed {
+                match filter(candidate.sst, &self.key) {
+                    None => {
+                        load.push(candidate.sst);
+                        end += 1;
+                        continue;
+                    }
+                    Some(false) => {
+                        self.candidates.remove(end);
+                        continue;
+                    }
+                    Some(true) => candidate.passed = true,
+                }
+            }
+            left -= 1;
+            end += 1;
         }
+        if !load.is_empty() {
+            return Pick::Load(load);
+        }
+        if end == 0 {
+            return Pick::Done;
+        }
+        Pick::Read(self.candidates.drain(..end).map(|c| c.sst).collect())
     }
 
-    /// Send the key to the SSTs of one pick, newest first.
+    /// Send the key to the SSTs of one read, newest first.
     pub(crate) fn send(&mut self, ssts: &[usize]) {
         self.rounds += 1;
-        self.waiting = false;
         self.inflight = ssts
             .iter()
             .map(|&sst| Inflight { sst, entries: None })
@@ -120,7 +220,7 @@ impl KeyRead {
 
     /// The key has no read in flight and waits for no filter.
     pub(crate) fn is_idle(&self) -> bool {
-        self.inflight.is_empty() && !self.waiting
+        self.inflight.is_empty() && self.waiting == 0
     }
 }
 
@@ -130,7 +230,98 @@ mod tests {
 
     use rstest::rstest;
 
-    use crate::multi_get::plan::FilterState::{Positive, Unknown};
+    #[rstest]
+    #[case::empty(&[], &[], &[])]
+    #[case::sorted(&["a", "b"], &["a", "b"], &[0, 1])]
+    #[case::reverse(&["c", "b", "a"], &["a", "b", "c"], &[2, 1, 0])]
+    #[case::duplicates(&["b", "a", "b", "a"], &["a", "b"], &[1, 0, 1, 0])]
+    fn should_sort_and_dedup_keys(
+        #[case] input: &[&str],
+        #[case] expected_keys: &[&str],
+        #[case] expected_slots: &[usize],
+    ) {
+        let batch = BatchKeys::new(input);
+
+        let expected_keys: Vec<Bytes> = expected_keys
+            .iter()
+            .map(|k| Bytes::copy_from_slice(k.as_bytes()))
+            .collect();
+        assert_eq!(batch.keys, expected_keys);
+        assert_eq!(batch.slots, expected_slots);
+        for (u, key) in batch.keys.iter().enumerate() {
+            assert_eq!(batch.position(key), Some(u));
+        }
+        assert_eq!(batch.position(b"no such key"), None);
+    }
+
+    /// The filter answer of each SST: passes, rejects, or not loaded.
+    const P: Option<bool> = Some(true);
+    const R: Option<bool> = Some(false);
+    const N: Option<bool> = None;
+
+    /// A key whose candidates are the SSTs `0..count`, after `rounds` reads.
+    fn key_with_candidates(count: usize, rounds: u64, operand: bool) -> KeyRead {
+        let mut key = key_read();
+        for sst in 0..count {
+            key.add_candidate(sst);
+        }
+        key.rounds = rounds;
+        if operand {
+            key.acc = merge(9);
+        }
+        key
+    }
+
+    #[rstest]
+    #[case::no_candidates(&[], 0, 4, false, Pick::Done)]
+    #[case::first_read_takes_one(&[P, P, P], 0, 4, false, Pick::Read(vec![0]))]
+    #[case::later_read_takes_lookahead(&[P, P, P, P, P], 1, 4, false, Pick::Read(vec![0, 1, 2, 3]))]
+    #[case::lookahead_0_acts_as_1(&[P, P], 1, 0, false, Pick::Read(vec![0]))]
+    #[case::operand_removes_the_limit(&[P, P, P], 0, 1, true, Pick::Read(vec![0, 1, 2]))]
+    #[case::not_loaded_is_free(&[N, N, P, P], 0, 4, false, Pick::Load(vec![0, 1]))]
+    #[case::all_not_loaded_loads_all(&[N, N, N], 0, 4, false, Pick::Load(vec![0, 1, 2]))]
+    #[case::rejects_do_not_count(&[P, R, P, P], 1, 2, false, Pick::Read(vec![0, 2]))]
+    #[case::all_rejected(&[R, R], 0, 4, false, Pick::Done)]
+    fn should_pick_like_get(
+        #[case] filters: &[Option<bool>],
+        #[case] rounds: u64,
+        #[case] lookahead: usize,
+        #[case] operand: bool,
+        #[case] expected: Pick,
+    ) {
+        let mut key = key_with_candidates(filters.len(), rounds, operand);
+
+        assert_eq!(key.pick(lookahead, |sst, _| filters[sst]), expected);
+    }
+
+    #[test]
+    fn should_check_each_filter_one_time() {
+        let mut key = key_with_candidates(3, 0, false);
+        let mut checks = [0; 3];
+        let mut filters = [N, P, R];
+
+        let pick = key.pick(4, |sst, _| {
+            checks[sst] += 1;
+            filters[sst]
+        });
+        assert_eq!(pick, Pick::Load(vec![0]));
+        // The filters of SST 0 arrive. SST 1 passed before, so the key does
+        // not check it again.
+        filters[0] = P;
+        let pick = key.pick(4, |sst, _| {
+            checks[sst] += 1;
+            filters[sst]
+        });
+        assert_eq!(pick, Pick::Read(vec![0]));
+        key.send(&[0]);
+        let pick = key.pick(4, |sst, _| {
+            checks[sst] += 1;
+            filters[sst]
+        });
+
+        assert_eq!(pick, Pick::Read(vec![1]));
+        assert_eq!(checks, [2, 1, 1]);
+    }
 
     fn value(seq: u64) -> Vec<RowEntry> {
         vec![RowEntry::new_value(b"k", b"v", seq)]
@@ -199,40 +390,5 @@ mod tests {
             assert_eq!(key.done, expected_done, "after sst {sst}");
             assert_eq!(key.is_idle(), expected_idle, "after sst {sst}");
         }
-    }
-
-    #[test]
-    fn should_pick_first_then_next() {
-        let candidates: Vec<Candidate> = [Positive; 4]
-            .iter()
-            .enumerate()
-            .map(|(sst, &state)| Candidate { sst, state })
-            .collect();
-        let mut key = key_read();
-
-        assert_eq!(key.pick(&candidates, 3), 1);
-        key.send(&[0]);
-        assert_eq!(key.rounds, 1);
-        assert_eq!(key.pick(&candidates[1..], 3), 3);
-        key.acc = merge(4);
-        assert_eq!(key.pick(&candidates[1..], 1), 3);
-    }
-
-    #[test]
-    fn should_wait_for_filters_until_sent() {
-        let mut key = key_read();
-        key.waiting = true;
-        assert!(!key.is_idle());
-        let candidates = [Candidate {
-            sst: 0,
-            state: Unknown,
-        }];
-        // An UNKNOWN SST is free to pick.
-        assert_eq!(key.pick(&candidates, 1), 1);
-
-        key.send(&[0]);
-
-        assert!(!key.waiting);
-        assert!(!key.is_idle());
     }
 }

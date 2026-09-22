@@ -187,15 +187,6 @@ enum FilterState {
     Negative,
 }
 
-/// AND across all filters: returns `true` iff every filter thinks `query`
-/// might match. An empty `filters` slice means no filter is configured for the
-/// SST; callers treat that as "might match" (do not skip). Shared by the
-/// single-key [`FilterEvaluator`] and the batched `multi_get` path
-/// ([`crate::multi_get`]).
-pub(crate) fn all_filters_might_match(filters: &[NamedFilter], query: &FilterQuery) -> bool {
-    filters.iter().all(|nf| nf.filter.might_match(query))
-}
-
 struct FilterEvaluator {
     query: FilterQuery,
     db_stats: Option<DbStats>,
@@ -1212,10 +1203,7 @@ impl RowEntryIterator for SstIterator<'_> {
 /// so the iterator reports the cancellation to its caller instead of panicking
 /// the task that is awaiting the fetch.
 fn block_fetch_join_error(join_err: tokio::task::JoinError, sst_id: SsTableId) -> SlateDBError {
-    task_join_error(join_err, format!("sst_block_fetch[{:?}]", sst_id))
-}
-
-pub(crate) fn task_join_error(join_err: tokio::task::JoinError, task_name: String) -> SlateDBError {
+    let task_name = format!("sst_block_fetch[{:?}]", sst_id);
     match join_err.try_into_panic() {
         Ok(panic_err) => {
             error!(

@@ -1,46 +1,43 @@
 //! The read phase of `multi_get`: pipelined reads of the candidate SSTs.
 //!
 //! Each open key reads its candidates newest first, in rounds. One round is
-//! one pick ([`KeyRead::pick`]) and
-//! the reads of the picked SSTs. The keys do not wait for each other: when
-//! the read of one SST returns, the keys of that read make their next pick
-//! at once. A batch that reads in lockstep pays the tail latency of the
-//! object store one time per step. A pipeline pays it about one time.
+//! one pick ([`KeyRead::pick`]) and the reads of the picked SSTs. The keys do
+//! not wait for each other: when the read of one SST returns, the keys of
+//! that read make their next pick at once. A batch that reads in lockstep
+//! pays the tail latency of the object store one time per step. A pipeline
+//! pays it about one time.
 //!
-//! The [`Pipeline`] drives an event loop over one `JoinSet`. A cache hit is
-//! an event that the caller handles inline, with no task.
+//! The [`Pipeline`] drives an event loop over the futures of its filter
+//! loads and reads. The futures run on the task of the batch, so a drop of
+//! the batch cancels them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::mem;
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 
-use crate::config::MultiGetOptions;
 use crate::error::SlateDBError;
 use crate::filter_policy::NamedFilter;
-use crate::reader::{ReadTrace, Reader};
-use crate::sst_iter::task_join_error;
 use crate::types::RowEntry;
 
-use super::key::KeyRead;
-use super::plan::{FilterState, Plan};
-use super::sst::{
-    load_filters as load_sst_filters, read_from_cache, read_sst, PendingKey, SstEntries, SstRead,
-};
-use super::sst_options;
+use super::candidates::{BatchSst, Filters};
+use super::key::{KeyRead, Pick};
+use super::sst::{PendingKey, SstEntries, SstReader};
 
-/// What one task of the read phase returns.
+/// What one future of the read phase returns.
 enum Event {
-    /// The filters of one UNKNOWN SST.
+    /// The filters of one SST.
     Filters {
-        /// Index into [`Plan::ssts`].
+        /// Index into [`Pipeline::ssts`].
         sst: usize,
         filters: Arc<[NamedFilter]>,
     },
     /// The read of one SST for some of its keys.
     Read {
-        /// Index into [`Plan::ssts`].
+        /// Index into [`Pipeline::ssts`].
         sst: usize,
         /// The keys that the read got. A key that the SST does not hold has
         /// no entries, but it still arrives.
@@ -49,45 +46,35 @@ enum Event {
     },
 }
 
-/// The read phase of one batch. It owns the state of the read and borrows
-/// the state of the batch.
+/// The read phase of one batch. It owns the state of the SSTs and borrows
+/// the state of the keys.
 pub(crate) struct Pipeline<'a> {
-    reader: &'a Reader,
-    plan: &'a mut Plan,
+    reader: SstReader<'a>,
     keys: &'a mut [KeyRead],
+    /// The SSTs that can hold keys. A key names them by index.
+    ssts: Vec<BatchSst>,
     max_seq: Option<u64>,
-    options: &'a MultiGetOptions,
-    read_trace: &'a ReadTrace,
-    /// The request semaphore of the batch.
-    requests: Arc<Semaphore>,
-    /// The keys that wait for a read of each SST.
+    /// The keys that wait for a read of each SST. The reads start at the end
+    /// of each turn of the loop, so the keys of one turn share a read.
     ready: BTreeMap<usize, Vec<PendingKey>>,
-    /// The SSTs with a filter load in flight.
-    loading: BTreeSet<usize>,
-    /// A drop of the `JoinSet` aborts its tasks.
-    tasks: JoinSet<Result<Event, SlateDBError>>,
+    /// The filter loads and the reads in flight.
+    events: FuturesUnordered<BoxFuture<'a, Result<Event, SlateDBError>>>,
 }
 
 impl<'a> Pipeline<'a> {
     pub(crate) fn new(
-        reader: &'a Reader,
-        plan: &'a mut Plan,
+        reader: SstReader<'a>,
         keys: &'a mut [KeyRead],
+        ssts: Vec<BatchSst>,
         max_seq: Option<u64>,
-        options: &'a MultiGetOptions,
-        read_trace: &'a ReadTrace,
     ) -> Self {
         Self {
             reader,
-            plan,
             keys,
+            ssts,
             max_seq,
-            options,
-            read_trace,
-            requests: Arc::new(Semaphore::new(options.max_fetch_tasks.max(1))),
             ready: BTreeMap::new(),
-            loading: BTreeSet::new(),
-            tasks: JoinSet::new(),
+            events: FuturesUnordered::new(),
         }
     }
 
@@ -101,122 +88,108 @@ impl<'a> Pipeline<'a> {
             // Keep the first pick cooperative.
             tokio::task::coop::consume_budget().await;
         }
-        self.flush().await?;
-        while let Some(joined) = self.tasks.join_next().await {
-            let event = joined.map_err(|e| task_join_error(e, "multi_get_read".to_string()))??;
-            match event {
+        self.start_reads();
+        while let Some(event) = self.events.next().await {
+            match event? {
                 Event::Filters { sst, filters } => self.on_filters(sst, filters).await,
-                Event::Read { sst, keys, entries } => self.arrive(sst, keys, entries).await,
+                Event::Read { sst, keys, entries } => self.on_read(sst, keys, entries).await,
             }
-            self.flush().await?;
+            self.start_reads();
         }
         Ok(self.keys.iter().map(|key| key.rounds).max().unwrap_or(0))
     }
 
-    /// Make the next pick of an idle open key. The pick goes to `ready`, or
-    /// the key waits for the filter loads of its UNKNOWN SSTs.
+    /// Make the next pick of an idle open key. The key waits for filter
+    /// loads, or its SSTs go to `ready`.
     fn schedule(&mut self, u: usize) {
-        let candidates = &self.plan.candidates[u];
-        if candidates.is_empty() {
-            // No SST is left to read. The key is absent, or it has only
-            // merge operands.
-            self.keys[u].done = true;
-            return;
-        }
-        let picked = self.keys[u].pick(candidates, self.options.lookahead);
-        // An UNKNOWN SST is free to pick, but only for its filter load.
-        // After the load, the key is POSITIVE or gone, and the next pick
-        // applies the limit.
-        let unknown: Vec<usize> = candidates[..picked]
-            .iter()
-            .filter(|c| c.state == FilterState::Unknown)
-            .map(|c| c.sst)
-            .collect();
-        if !unknown.is_empty() {
-            self.keys[u].waiting = true;
-            for sst in unknown {
-                self.load_filters(sst);
+        let (options, db_stats) = (self.reader.options, self.reader.db_stats);
+        let ssts = &self.ssts;
+        let pick = self.keys[u].pick(options.lookahead, |sst, key| {
+            ssts[sst].might_hold(key, &options.filter_context, db_stats)
+        });
+        match pick {
+            // The key is absent, or it has only merge operands.
+            Pick::Done => self.keys[u].done = true,
+            Pick::Load(ssts) => {
+                self.keys[u].waiting = ssts.len();
+                for sst in ssts {
+                    self.load_filters(sst, u);
+                }
             }
-            return;
-        }
-        let ssts: Vec<usize> = self.plan.candidates[u]
-            .drain(..picked)
-            .map(|c| c.sst)
-            .collect();
-        self.keys[u].send(&ssts);
-        for sst in ssts {
-            self.ready.entry(sst).or_default().push(PendingKey {
-                idx: u,
-                key: self.keys[u].key.clone(),
-            });
+            Pick::Read(ssts) => {
+                self.keys[u].send(&ssts);
+                for sst in ssts {
+                    let key = self.keys[u].key.clone();
+                    let pending = PendingKey { idx: u, key };
+                    self.ready.entry(sst).or_default().push(pending);
+                }
+            }
         }
     }
 
-    /// Read each SST of `ready`. A cache hit can make a new pick, so the
-    /// loop runs until `ready` is empty.
-    async fn flush(&mut self) -> Result<(), SlateDBError> {
-        while let Some((sst, mut keys)) = self.ready.pop_first() {
-            keys.sort_by_key(|pk| pk.idx);
-            self.read_group(sst, keys).await?;
+    /// Start the filter load of one SST for the key `u`, unless one is in
+    /// flight.
+    fn load_filters(&mut self, sst: usize, u: usize) {
+        let batch_sst = &mut self.ssts[sst];
+        match &mut batch_sst.filters {
+            Filters::Loading(waiters) => waiters.push(u),
+            Filters::NotLoaded => {
+                batch_sst.filters = Filters::Loading(vec![u]);
+                let load = self.reader.load_filters(batch_sst.target.clone());
+                let event = async move {
+                    let filters = load.await?;
+                    Ok(Event::Filters { sst, filters })
+                };
+                self.events.push(event.boxed());
+            }
+            Filters::Loaded(_) => unreachable!("a pick loads only filters that are not loaded"),
         }
-        Ok(())
     }
 
-    /// Read one SST for a group of its keys. The cache answers first, inline.
-    /// Only the keys that miss go to a task.
-    async fn read_group(&mut self, sst: usize, keys: Vec<PendingKey>) -> Result<(), SlateDBError> {
-        let plan_sst = &self.plan.ssts[sst];
-        let filters_present = plan_sst.filters.as_ref().is_some_and(|f| !f.is_empty());
-        let mut entries = read_from_cache(
-            &plan_sst.view.sst,
-            &keys,
-            filters_present,
-            &self.reader.table_store,
-            Some(&self.reader.db_stats),
-        )
-        .await?;
-        let misses = std::mem::take(&mut entries.misses);
-        let missed: BTreeSet<usize> = misses.iter().map(|pk| pk.idx).collect();
-        if !misses.is_empty() {
-            // With no cache, the index comes from an earlier read.
-            let index = entries.index.clone().or_else(|| plan_sst.index.clone());
-            let read = SstRead {
-                view: plan_sst.view.clone(),
-                keys: misses,
-                filters: plan_sst.filters.clone(),
-                index,
-                sst_level: Some(plan_sst.level.clone()),
-                options: sst_options(self.options, &plan_sst.segment),
+    /// Start one read per SST of `ready`.
+    fn start_reads(&mut self) {
+        for (sst, keys) in mem::take(&mut self.ready) {
+            let batch_sst = &self.ssts[sst];
+            let target = batch_sst.target.clone();
+            let index = batch_sst.index.clone();
+            let idxs: Vec<usize> = keys.iter().map(|pk| pk.idx).collect();
+            let read = self
+                .reader
+                .read(target, index, batch_sst.has_filters(), keys);
+            let event = async move {
+                let entries = read.await?;
+                Ok(Event::Read {
+                    sst,
+                    keys: idxs,
+                    entries,
+                })
             };
-            let sst_read = read_sst(
-                read,
-                self.reader.table_store.clone(),
-                self.requests.clone(),
-                self.options.clone(),
-                self.read_trace.clone(),
-                Some(self.reader.db_stats.clone()),
-            );
-            let keys: Vec<usize> = missed.iter().copied().collect();
-            self.tasks.spawn(async move {
-                let entries = sst_read.await?;
-                Ok(Event::Read { sst, keys, entries })
-            });
+            self.events.push(event.boxed());
         }
-        let hits: Vec<usize> = keys
-            .iter()
-            .map(|pk| pk.idx)
-            .filter(|idx| !missed.contains(idx))
-            .collect();
-        self.arrive(sst, hits, entries).await;
-        Ok(())
+    }
+
+    /// Apply the loaded filters of one SST, then make the pick of each key
+    /// that waits for no other load.
+    async fn on_filters(&mut self, sst: usize, filters: Arc<[NamedFilter]>) {
+        let loaded = Filters::Loaded(filters);
+        let Filters::Loading(waiters) = mem::replace(&mut self.ssts[sst].filters, loaded) else {
+            unreachable!("only a load in flight gets filters");
+        };
+        for u in waiters {
+            let key = &mut self.keys[u];
+            key.waiting -= 1;
+            if !key.done && key.is_idle() {
+                self.schedule(u);
+            }
+            // Keep the pick pass cooperative.
+            tokio::task::coop::consume_budget().await;
+        }
     }
 
     /// Apply the read of one SST to its keys. A key whose pick is complete
     /// makes its next pick.
-    async fn arrive(&mut self, sst: usize, keys: Vec<usize>, entries: SstEntries) {
-        if entries.index.is_some() {
-            self.plan.ssts[sst].index = entries.index;
-        }
+    async fn on_read(&mut self, sst: usize, keys: Vec<usize>, entries: SstEntries) {
+        self.ssts[sst].index = Some(entries.index);
         let mut found: BTreeMap<usize, Vec<RowEntry>> = entries
             .found
             .into_iter()
@@ -232,49 +205,5 @@ impl<'a> Pipeline<'a> {
             // Keep the result pass cooperative.
             tokio::task::coop::consume_budget().await;
         }
-    }
-
-    /// Apply the loaded filters of one SST, then make the pick of each key
-    /// that waits for a filter.
-    async fn on_filters(&mut self, sst: usize, filters: Arc<[NamedFilter]>) {
-        self.plan.apply_filters(
-            sst,
-            filters,
-            |u| self.keys[u].done,
-            &self.options.filter_context,
-            Some(&self.reader.db_stats),
-        );
-        self.loading.remove(&sst);
-        for u in 0..self.keys.len() {
-            if self.keys[u].waiting && !self.keys[u].done {
-                self.schedule(u);
-            }
-            // Keep the pick pass cooperative.
-            tokio::task::coop::consume_budget().await;
-        }
-    }
-
-    /// Spawn the filter load of one SST, unless one is in flight.
-    fn load_filters(&mut self, sst: usize) {
-        if !self.loading.insert(sst) {
-            return;
-        }
-        let plan_sst = &self.plan.ssts[sst];
-        let (view, level) = (plan_sst.view.clone(), plan_sst.level.clone());
-        let sst_options = sst_options(self.options, &plan_sst.segment);
-        let table_store = self.reader.table_store.clone();
-        let (requests, read_trace) = (self.requests.clone(), self.read_trace.clone());
-        self.tasks.spawn(async move {
-            let filters = load_sst_filters(
-                &view,
-                &sst_options,
-                Some(&level),
-                &table_store,
-                &requests,
-                &read_trace,
-            );
-            let filters = filters.await?;
-            Ok(Event::Filters { sst, filters })
-        });
     }
 }
