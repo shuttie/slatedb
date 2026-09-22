@@ -74,7 +74,7 @@ impl ReadTrace {
     }
 
     /// Same as [`Self::new`], with the batch size on the read span. The batch
-    /// records `waves` when it ends.
+    /// records `rounds` when it ends.
     pub(crate) fn new_multi_get(tracing_options: Option<TracingOptions>, keys: usize) -> Self {
         let read_span = tracing_options
             .as_ref()
@@ -83,7 +83,7 @@ impl ReadTrace {
                     "slatedb.read",
                     trace_id = tracing_options.trace_id.as_str(),
                     keys,
-                    waves = tracing::field::Empty,
+                    rounds = tracing::field::Empty,
                 )
             })
             .unwrap_or_else(tracing::Span::none);
@@ -1772,7 +1772,7 @@ mod tests {
         None, b"v0+1+2", 2, 3 + 2 + 2 * 2,
     )]
     #[tokio::test]
-    async fn test_multi_get_waves(
+    async fn test_multi_get_rounds(
         #[case] entries: Vec<TestEntry>,
         #[case] max_seq: Option<u64>,
         #[case] expected: &'static [u8],
@@ -1794,7 +1794,7 @@ mod tests {
 
         let value = values[0].as_ref().and_then(|entry| entry.value.as_bytes());
         assert_eq!(value, Some(Bytes::from_static(expected)));
-        let waves = lookup_metric_with_labels(&recorder, crate::db_stats::MULTI_GET_WAVES, &[]);
+        let waves = lookup_metric_with_labels(&recorder, crate::db_stats::MULTI_GET_ROUNDS, &[]);
         assert_eq!(waves, Some(expected_waves));
         assert_eq!(recording.recorded_get_ranges(false).len(), expected_gets);
         Ok(())

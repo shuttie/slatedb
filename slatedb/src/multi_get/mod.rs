@@ -2,19 +2,17 @@
 //!
 //! - [`plan`]: which SSTs can hold which keys. Memory only.
 //! - [`sst`]: how one SST is read for its keys.
+//! - [`pipeline`]: the read phase. Each key reads its SSTs newest first,
+//!   and no key waits for the reads of another key.
 //! - This module: the orchestrator. It reads the write batch and the
-//!   memtables, builds the plan, reads the SSTs, and resolves each key with
-//!   the components of the single-key `get` path.
+//!   memtables, builds the plan, runs the pipeline, and resolves each key
+//!   with the components of the single-key `get` path.
 
+mod pipeline;
 mod plan;
 mod sst;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-
 use bytes::Bytes;
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use crate::batch::{WriteBatch, WriteBatchIterator};
@@ -22,30 +20,15 @@ use crate::bytes_range::BytesRange;
 use crate::config::MultiGetOptions;
 use crate::db_iter::GetIterator;
 use crate::error::SlateDBError;
-use crate::filter_policy::NamedFilter;
 use crate::iter::{IterationOrder, RowEntryIterator, VecRowIterator};
 use crate::mem_table::KVTable;
 use crate::merge_operator::{MergeOperatorIterator, MergeOperatorRequiredIterator};
 use crate::reader::{DbStateReader, ReadTrace, Reader};
-use crate::sst_iter::{task_join_error, SstIteratorOptions};
+use crate::sst_iter::SstIteratorOptions;
 use crate::types::{RowEntry, ValueDeletable};
 
-use plan::{candidate_ssts, pick_first, pick_next, BatchKeys, FilterState, Plan};
-use sst::{load_filters, read_from_cache, read_sst, KeyEntries, PendingKey, SstEntries, SstRead};
-
-/// The result of one SST read of a wave.
-struct SstResult {
-    /// Index into [`Plan::ssts`].
-    sst: usize,
-    entries: SstEntries,
-}
-
-/// The filters that a wave loaded for one SST.
-struct LoadedFilters {
-    /// Index into [`Plan::ssts`].
-    sst: usize,
-    filters: Arc<[NamedFilter]>,
-}
+use pipeline::Pipeline;
+use plan::{candidate_ssts, BatchKeys, Plan};
 
 impl Reader {
     /// Batched point lookup: resolve many keys against a single consistent
@@ -179,72 +162,23 @@ impl Reader {
             resolved[u] |= candidates.is_empty();
         }
 
-        // 4. Read, in waves. Each open key reads its next candidates, newest
-        //    first, until it has a base value or no candidate is left.
-        let requests = Arc::new(Semaphore::new(options.max_fetch_tasks.max(1)));
-        let mut open: Vec<usize> = (0..n).filter(|&u| !resolved[u]).collect();
-        let mut waves: u64 = 0;
-        while !open.is_empty() {
-            waves += 1;
-            let pick = |plan: &Plan, u: usize| {
-                // An open key holds only merge operands.
-                let has_operand = !wb_acc[u].is_empty() || !acc[u].is_empty();
-                match waves {
-                    1 => pick_first(&plan.candidates[u], has_operand),
-                    _ => pick_next(&plan.candidates[u], has_operand, options.lookahead),
-                }
-            };
-            // An UNKNOWN SST is free to pick, but only for its filter load.
-            // After the load, its keys are POSITIVE or gone, and the second
-            // pick applies the limit to them.
-            let unknown: BTreeSet<usize> = open
-                .iter()
-                .flat_map(|&u| &plan.candidates[u][..pick(&plan, u)])
-                .filter(|c| c.state == FilterState::Unknown)
-                .map(|c| c.sst)
-                .collect();
-            let loads = self.load_filters(&plan, unknown, options, &requests, &read_trace);
-            for LoadedFilters { sst, filters } in loads.await? {
-                let stats = Some(&self.db_stats);
-                plan.apply_filters(sst, filters, &resolved, &options.filter_context, stats);
-            }
-            let mut wave: BTreeMap<usize, Vec<PendingKey>> = BTreeMap::new();
-            for &u in &open {
-                let picked = pick(&plan, u);
-                for candidate in plan.candidates[u].drain(..picked) {
-                    wave.entry(candidate.sst).or_default().push(PendingKey {
-                        idx: u,
-                        key: batch.keys[u].clone(),
-                    });
-                }
-                // Keep the wave build cooperative.
-                tokio::task::coop::consume_budget().await;
-            }
-
-            let results = self
-                .read_wave(&plan, wave, options, &requests, &read_trace)
-                .await?;
-            // `append_versions` re-filters by max_seq and stops each key at its
-            // first surviving Value/Tombstone, so the entries of older SSTs are
-            // dropped exactly as in the single-key walk. Memtable entries are
-            // already in `acc` and stay first (they are newer than anything on
-            // disk).
-            for SstResult { sst, entries } in results {
-                if entries.index.is_some() {
-                    plan.ssts[sst].index = entries.index;
-                }
-                for KeyEntries { idx: u, entries } in entries.found {
-                    if !resolved[u] {
-                        append_versions(entries, max_seq, &mut acc[u], &mut resolved[u]);
-                    }
-                }
-                // Keep the result pass cooperative.
-                tokio::task::coop::consume_budget().await;
-            }
-            open.retain(|&u| !resolved[u] && !plan.candidates[u].is_empty());
-        }
-        self.db_stats.multi_get_waves.increment(waves);
-        read_trace.read_span().record("waves", waves);
+        // 4. Read. Each open key reads its candidates newest first, in
+        //    rounds, until it has a base value or no candidate is left. The
+        //    keys do not wait for each other.
+        let pipeline = Pipeline::new(
+            self,
+            &mut plan,
+            &batch.keys,
+            max_seq,
+            options,
+            &read_trace,
+            &wb_acc,
+            &mut acc,
+            &mut resolved,
+        );
+        let rounds = pipeline.run().await?;
+        self.db_stats.multi_get_rounds.increment(rounds);
+        read_trace.read_span().record("rounds", rounds);
 
         // 5. Resolve each unique key, then scatter to input positions.
         let mut values: Vec<Option<RowEntry>> = Vec::with_capacity(n);
@@ -263,108 +197,6 @@ impl Reader {
             return Ok(batch.slots.iter().map(|&u| values[u].take()).collect());
         }
         Ok(batch.slots.iter().map(|&u| values[u].clone()).collect())
-    }
-
-    /// Load the filters of the given SSTs of the plan, all in parallel.
-    async fn load_filters(
-        &self,
-        plan: &Plan,
-        ssts: BTreeSet<usize>,
-        options: &MultiGetOptions,
-        requests: &Arc<Semaphore>,
-        read_trace: &ReadTrace,
-    ) -> Result<Vec<LoadedFilters>, SlateDBError> {
-        // A drop of the `JoinSet` aborts its tasks.
-        let mut tasks: JoinSet<Result<LoadedFilters, SlateDBError>> = JoinSet::new();
-        for sst in ssts {
-            let plan_sst = &plan.ssts[sst];
-            let (view, level) = (plan_sst.view.clone(), plan_sst.level.clone());
-            let sst_options = sst_options(options, &plan_sst.segment);
-            let table_store = self.table_store.clone();
-            let (requests, read_trace) = (requests.clone(), read_trace.clone());
-            tasks.spawn(async move {
-                let filters = load_filters(
-                    &view,
-                    &sst_options,
-                    Some(&level),
-                    &table_store,
-                    &requests,
-                    &read_trace,
-                );
-                let filters = filters.await?;
-                Ok(LoadedFilters { sst, filters })
-            });
-        }
-        let mut loaded = Vec::with_capacity(tasks.len());
-        while let Some(joined) = tasks.join_next().await {
-            let result =
-                joined.map_err(|e| task_join_error(e, "multi_get_filter_load".to_string()))?;
-            loaded.push(result?);
-        }
-        Ok(loaded)
-    }
-
-    /// Read each SST of one wave for its keys. Each SST answers from the cache
-    /// first, inline. Only the keys that miss go to a task. The results are in
-    /// plan order, newest first.
-    async fn read_wave(
-        &self,
-        plan: &Plan,
-        wave: BTreeMap<usize, Vec<PendingKey>>,
-        options: &MultiGetOptions,
-        requests: &Arc<Semaphore>,
-        read_trace: &ReadTrace,
-    ) -> Result<Vec<SstResult>, SlateDBError> {
-        let mut results: Vec<SstResult> = Vec::with_capacity(wave.len());
-        // A drop of the `JoinSet` aborts its tasks.
-        let mut tasks: JoinSet<Result<SstResult, SlateDBError>> = JoinSet::new();
-        for (sst, keys) in wave {
-            let plan_sst = &plan.ssts[sst];
-            let filters_present = plan_sst.filters.as_ref().is_some_and(|f| !f.is_empty());
-            let mut entries = read_from_cache(
-                &plan_sst.view.sst,
-                &keys,
-                filters_present,
-                &self.table_store,
-                Some(&self.db_stats),
-            )
-            .await?;
-            let misses = std::mem::take(&mut entries.misses);
-            // With no cache, the index comes from an earlier wave.
-            let index = entries.index.clone().or_else(|| plan_sst.index.clone());
-            results.push(SstResult { sst, entries });
-            if misses.is_empty() {
-                continue;
-            }
-            let read = SstRead {
-                view: plan_sst.view.clone(),
-                keys: misses,
-                filters: plan_sst.filters.clone(),
-                index,
-                sst_level: Some(plan_sst.level.clone()),
-                options: sst_options(options, &plan_sst.segment),
-            };
-            let sst_read = read_sst(
-                read,
-                self.table_store.clone(),
-                requests.clone(),
-                options.clone(),
-                read_trace.clone(),
-                Some(self.db_stats.clone()),
-            );
-            tasks.spawn(async move {
-                let entries = sst_read.await?;
-                Ok(SstResult { sst, entries })
-            });
-        }
-        while let Some(joined) = tasks.join_next().await {
-            let result =
-                joined.map_err(|e| task_join_error(e, "multi_get_sst_read".to_string()))?;
-            results.push(result?);
-        }
-        // Two results of one SST have different keys.
-        results.sort_by_key(|result| result.sst);
-        Ok(results)
     }
 
     /// Produce the final entry for one key by replaying its accumulated versions

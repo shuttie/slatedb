@@ -20,7 +20,7 @@ use slatedb::config::{
     SizeTieredCompactionSchedulerOptions, WriteOptions,
 };
 use slatedb::db_cache::foyer::FoyerCache;
-use slatedb::db_stats::{MULTI_GET_KEYS, MULTI_GET_WAVES, REQUEST_COUNT};
+use slatedb::db_stats::{MULTI_GET_KEYS, MULTI_GET_ROUNDS, REQUEST_COUNT};
 use slatedb::instrumented_object_store_stats::REQUEST_COUNT as OBJECT_STORE_REQUEST_COUNT;
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
@@ -516,7 +516,7 @@ async fn test_multi_get_metrics() {
 
     assert_eq!(counter(&recorder, REQUEST_COUNT, &[("op", "multi_get")]), 1);
     assert_eq!(counter(&recorder, MULTI_GET_KEYS, &[]), 3);
-    assert_eq!(counter(&recorder, MULTI_GET_WAVES, &[]), 1);
+    assert_eq!(counter(&recorder, MULTI_GET_ROUNDS, &[]), 1);
     assert_eq!(counter(&recorder, REQUEST_COUNT, &[("op", "get")]), 0);
     db.close().await.unwrap();
 }
