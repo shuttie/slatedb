@@ -790,11 +790,14 @@ SlateDB already has.
 
 - Unit tests: the candidate walk, the pick of a key, the arrival of reads,
   and the read of one SST, as `rstest` tables next to the code.
-- Integration tests: one differential test that compares a batch with a `get`
-  loop. The fixture follows `tests/scan_model.rs` and forces a compaction, so
-  the keys spread over L0 and sorted runs.
+- Integration tests: differential tests that compare a batch with a `get`
+  loop, on a `Db`, a `DbReader`, a `DbSnapshot`, a transaction, and a
+  projected clone. The layered fixture follows `tests/scan_model.rs`: it forces
+  a compaction and then adds new L0 SSTs, so one query sees keys in L0 and in
+  sorted runs.
 - Request count tests: a counting object store proves goal 3. The batch must
-  send no more GETs than the loop, with a warm and with a cold cache.
+  send no more GETs than the loop, with no cache, an empty cache, a partly warm
+  cache, and a warm cache, with and without a merge operator.
 - Fault-injection tests: a failed block read fails the batch, and a dropped
   future leaves no request in flight.
 - Deterministic simulation tests: the `slatedb-dst` workload gets a `MultiGet`
