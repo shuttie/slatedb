@@ -1,7 +1,7 @@
 // our microbenchmarks use pprof, but it doesn't work on windows
 #![cfg(not(windows))]
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use object_store::memory::InMemory;
 use pprof::criterion::{Output, PProfProfiler};
 use slatedb::config::{PutOptions, Settings, WriteOptions};
@@ -51,7 +51,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 fn bench_batch_reads(c: &mut Criterion, runtime: &Runtime) {
     let object_store = Arc::new(InMemory::new());
     let settings = Settings {
-        l0_sst_size_bytes: 4096,
+        //l0_sst_size_bytes: 4096,
         min_filter_keys: 0,
         ..Default::default()
     };
@@ -61,7 +61,7 @@ fn bench_batch_reads(c: &mut Criterion, runtime: &Runtime) {
             .build()
             .await
             .expect("open failed");
-        for i in 0..4000u32 {
+        for i in 0..1000000u32 {
             let key = format!("key{i:06}");
             let value = format!("value{i:06}");
             db.put_with_options(
@@ -80,25 +80,38 @@ fn bench_batch_reads(c: &mut Criterion, runtime: &Runtime) {
         db
     });
 
-    // 32 keys spread across the key space (so they land in many distinct SSTs).
-    let keys: Vec<Vec<u8>> = (0..1000u32)
-        .map(|i| format!("key{:06}", i * 4).into_bytes())
-        .collect();
+    // Keys spread across the key space (so they land in many distinct SSTs).
+    let make_keys = |n: u32| -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| format!("key{:06}", i * 4).into_bytes())
+            .collect()
+    };
 
-    c.bench_function("multi_get_1k", |b| {
-        b.to_async(runtime).iter(|| async {
-            black_box(db.multi_get(&keys).await.expect("multi_get failed"));
-        })
-    });
-    c.bench_function("get_loop_1k", |b| {
-        b.to_async(runtime).iter(|| async {
-            let mut out = Vec::with_capacity(keys.len());
-            for key in &keys {
-                out.push(db.get(key).await.expect("get failed"));
-            }
-            black_box(out);
-        })
-    });
+    let mut multi_get = c.benchmark_group("multi_get");
+    for &n in &[1u32, 100, 1000] {
+        let keys = make_keys(n);
+        multi_get.bench_with_input(BenchmarkId::from_parameter(n), &keys, |b, keys| {
+            b.to_async(runtime).iter(|| async {
+                black_box(db.multi_get(keys).await.expect("multi_get failed"));
+            })
+        });
+    }
+    multi_get.finish();
+
+    let mut get_loop = c.benchmark_group("get_loop");
+    for &n in &[1u32, 100, 1000] {
+        let keys = make_keys(n);
+        get_loop.bench_with_input(BenchmarkId::from_parameter(n), &keys, |b, keys| {
+            b.to_async(runtime).iter(|| async {
+                let mut out = Vec::with_capacity(keys.len());
+                for key in keys {
+                    out.push(db.get(key).await.expect("get failed"));
+                }
+                black_box(out);
+            })
+        });
+    }
+    get_loop.finish();
 }
 
 criterion_group! {

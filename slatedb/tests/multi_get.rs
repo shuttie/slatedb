@@ -312,10 +312,7 @@ async fn test_multi_get_db_reader() {
 
     // Open a read-only reader over the persisted state and check the
     // differential invariant against the reader's own single get.
-    let reader = DbReader::builder(path, object_store)
-        .build()
-        .await
-        .unwrap();
+    let reader = DbReader::builder(path, object_store).build().await.unwrap();
     for batch_start in [0usize, 25, 60] {
         let keys: Vec<Vec<u8>> = (batch_start..batch_start + 30).map(key).collect();
         let multi = reader.multi_get(&keys).await.unwrap();
@@ -385,7 +382,10 @@ async fn test_multi_get_projected_clone_matches_get_loop() {
         .unwrap();
 
     assert_random_batches(&clone, &mut rng, key_space).await;
-    let outside = clone.multi_get(&[key(0), key(19), key(50), key(79)]).await.unwrap();
+    let outside = clone
+        .multi_get(&[key(0), key(19), key(50), key(79)])
+        .await
+        .unwrap();
     assert!(
         outside.iter().all(Option::is_none),
         "keys outside the projection must be absent"
