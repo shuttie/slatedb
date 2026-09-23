@@ -26,10 +26,6 @@ impl BatchKeys {
         }
         Self { keys, slots }
     }
-
-    pub(crate) fn position(&self, key: &[u8]) -> Option<usize> {
-        self.keys.binary_search_by(|k| k.as_ref().cmp(key)).ok()
-    }
 }
 
 /// One SST that can hold a key.
@@ -248,10 +244,6 @@ mod tests {
             .collect();
         assert_eq!(batch.keys, expected_keys);
         assert_eq!(batch.slots, expected_slots);
-        for (u, key) in batch.keys.iter().enumerate() {
-            assert_eq!(batch.position(key), Some(u));
-        }
-        assert_eq!(batch.position(b"no such key"), None);
     }
 
     /// The filter answer of each SST: passes, rejects, or not loaded.

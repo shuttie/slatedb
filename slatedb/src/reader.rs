@@ -1610,6 +1610,7 @@ mod tests {
     ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
         let mut test_db_state = TestDbState::new().await;
         let write_batch = populate_db_state(&mut test_db_state, entries).await?;
+        let locked_write_batch = write_batch.clone().map(parking_lot::RwLock::new);
         let reader = multi_get_reader(&test_db_state, last_committed_seq, merge);
         let read_options = ReadOptions::default().with_dirty(dirty);
 
@@ -1622,7 +1623,7 @@ mod tests {
                 &batch,
                 &MultiGetOptions::default().with_dirty(dirty),
                 &test_db_state,
-                write_batch.as_ref(),
+                locked_write_batch.as_ref(),
                 max_seq,
             )
             .await?;

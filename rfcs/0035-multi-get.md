@@ -533,11 +533,11 @@ the results cannot drift from `get`.
 
 - It reads the write batch first. Entries of the write batch skip the
   `max_seq` filter.
-- It reads the write batch in one walk under the read guard, and keeps the
-  entries of the batch keys. It never clones the write batch, which can be
-  large.
-- It records each key of the batch with `track_read_keys`, including the keys
-  that return `None`.
+- It looks up each key in the write batch under the read guard, as `get` does.
+  It never clones the write batch, which can be large.
+- Under SSI, it records each key of the batch with `track_read_keys`,
+  including the keys that return `None`. Under SI, it records no keys, as
+  `get` does.
 
 ### Failure handling
 
@@ -570,8 +570,8 @@ errors as a `get`.
 
 - A batch computes `max_seq` one time and reads all keys from one state view.
 - `DbSnapshot::multi_get` reads at the sequence number of the snapshot.
-- `DbTransaction::multi_get` reads the write batch first and records each key
-  for conflict detection.
+- `DbTransaction::multi_get` reads the write batch first. Under SSI, it records
+  each key for conflict detection.
 
 ### Time, Retention, and Derived State
 

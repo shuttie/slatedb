@@ -249,16 +249,15 @@ impl DbTransaction {
         }
 
         let db_state = self.db_inner.state.read().view();
-        // Clone the write batch once (like the commit path) so we can probe every
-        // key against the transaction's uncommitted writes.
-        let write_batch = self.write_batch.read().clone();
+        // The reader looks up each key under the read guard, as `get` does, so
+        // the write batch is never cloned.
         self.db_inner
             .reader
             .multi_get_with_options(
                 keys,
                 options,
                 &db_state,
-                Some(&write_batch),
+                Some(&self.write_batch),
                 Some(self.started_seq),
             )
             .await

@@ -17,6 +17,7 @@ mod sst;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 use tracing::Instrument;
 
@@ -60,7 +61,7 @@ impl Reader {
         keys: &[K],
         options: &MultiGetOptions,
         db_state: &(dyn DbStateReader + Sync + Send),
-        write_batch: Option<&WriteBatch>,
+        write_batch: Option<&RwLock<WriteBatch>>,
         max_seq: Option<u64>,
     ) -> Result<Vec<Option<RowEntry>>, SlateDBError> {
         let read_trace = ReadTrace::new_multi_get(options.tracing_options.clone(), keys.len());
@@ -80,7 +81,7 @@ impl Reader {
         keys: &[K],
         options: &MultiGetOptions,
         db_state: &(dyn DbStateReader + Sync + Send),
-        write_batch: Option<&WriteBatch>,
+        write_batch: Option<&RwLock<WriteBatch>>,
         max_seq: Option<u64>,
         read_trace: ReadTrace,
     ) -> Result<Vec<Option<RowEntry>>, SlateDBError> {
@@ -98,24 +99,27 @@ impl Reader {
 
         // 1. Write batch (transaction only). Entries carry seq u64::MAX and are
         //    not max_seq filtered (hence `None`), matching the single-key get
-        //    path. One full-range pass over the batch instead of a point
-        //    iterator per key; batches are memory-bounded, so the full walk is
-        //    cheap even for small key lists.
+        //    path. Each key is a point lookup under the read guard, as in
+        //    `get`, so the cost grows with the keys and not with the batch.
+        //    The guard is released before the next await.
         if let Some(wb) = write_batch {
-            let mut iter = WriteBatchIterator::new(
-                wb,
-                BytesRange::from(..),
-                IterationOrder::Ascending,
-                u64::MAX,
-                None,
-                None,
-            );
-            iter.init().await?;
-            while let Some(entry) = iter.next().await? {
-                if let Some(u) = batch.position(entry.key.as_ref()) {
-                    key_reads[u].push_write(entry);
+            for key in key_reads.iter_mut() {
+                let mut iter = {
+                    let guard = wb.read();
+                    WriteBatchIterator::new(
+                        &guard,
+                        BytesRange::from_slice(key.key.as_ref()..=key.key.as_ref()),
+                        IterationOrder::Ascending,
+                        u64::MAX,
+                        None,
+                        None,
+                    )
+                };
+                iter.init().await?;
+                while let Some(entry) = iter.next().await? {
+                    key.push_write(entry);
                 }
-                // Keep the in-memory walk cooperative.
+                // Keep the in-memory lookups cooperative.
                 tokio::task::coop::consume_budget().await;
             }
         }
