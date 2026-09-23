@@ -586,6 +586,8 @@ errors as a `get`.
 - [x] Sequence numbers
 
 - A batch computes `max_seq` one time and reads all keys from one state view.
+  With `dirty: true`, `Memory` durability, and no snapshot, `max_seq` has no
+  bound, so the batch is not atomic. This is the same as a `scan` with `dirty: true`.
 - `DbSnapshot::multi_get` reads at the sequence number of the snapshot.
 - `DbTransaction::multi_get` reads the write batch first. Under SSI, it records
   each key for conflict detection.
