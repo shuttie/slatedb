@@ -370,6 +370,8 @@ impl BlockFetch {
             } else if self.filtered {
                 self.db_stats.sst_filter_point_false_positives.increment(1);
             }
+            // Keep the scan of a read with many keys cooperative.
+            tokio::task::coop::consume_budget().await;
         }
         let keys = self.keys.iter().map(|key| key.key.idx).collect();
         let index = self.index;

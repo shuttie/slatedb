@@ -17,6 +17,7 @@ use crate::manifest::{ManifestCore, Segment};
 use crate::reader::{ReadTrace, SstTraceLevel};
 
 use super::key::KeyRead;
+use super::KEYS_PER_YIELD;
 
 /// The filters of one SST of the batch.
 pub(crate) enum Filters {
@@ -113,42 +114,48 @@ pub(crate) async fn candidate_ssts(core: &ManifestCore, keys: &mut [KeyRead]) ->
         ssts.push(BatchSst::new(view, segment.prefix.clone(), level));
         ssts.len() - 1
     };
-    for (segment, group) in group_by_segment(core, keys) {
+    for (segment, group) in group_by_segment(core, keys).await {
         let tree = &segment.tree;
         // An L0 SST can hold each key of its range.
         for view in tree.l0.iter() {
             let mut sst = None;
-            for &u in &group {
-                if view_holds_key(view, &keys[u].key) {
-                    let sst = *sst
-                        .get_or_insert_with(|| add(&mut ssts, view, &segment, SstTraceLevel::L0));
-                    keys[u].add_candidate(sst);
+            for chunk in group.chunks(KEYS_PER_YIELD) {
+                for &u in chunk {
+                    if view_holds_key(view, &keys[u].key) {
+                        let sst = *sst.get_or_insert_with(|| {
+                            add(&mut ssts, view, &segment, SstTraceLevel::L0)
+                        });
+                        keys[u].add_candidate(sst);
+                    }
                 }
+                // Keep the candidate walk cooperative.
+                tokio::task::coop::consume_budget().await;
             }
-            // Keep the candidate walk cooperative.
-            tokio::task::coop::consume_budget().await;
         }
         for run in tree.compacted.iter() {
             // A key can have more than one view in a run: its versions can
             // cross the border of two views.
             let mut sst_of_view: BTreeMap<usize, usize> = BTreeMap::new();
-            for &u in &group {
-                for vi in run.point_table_idx_covering_key(&keys[u].key) {
-                    let view = &run.sst_views()[vi];
-                    // The last view of a run has no upper bound. `get` drops
-                    // it for a key outside the view's range, so skip it too.
-                    if !view_holds_key(view, &keys[u].key) {
-                        continue;
+            for chunk in group.chunks(KEYS_PER_YIELD) {
+                for &u in chunk {
+                    for vi in run.point_table_idx_covering_key(&keys[u].key) {
+                        let view = &run.sst_views()[vi];
+                        // The last view of a run has no upper bound. `get`
+                        // drops it for a key outside the view's range, so
+                        // skip it too.
+                        if !view_holds_key(view, &keys[u].key) {
+                            continue;
+                        }
+                        let sst = *sst_of_view.entry(vi).or_insert_with(|| {
+                            let level = SstTraceLevel::SortedRun(run.id);
+                            add(&mut ssts, view, &segment, level)
+                        });
+                        keys[u].add_candidate(sst);
                     }
-                    let sst = *sst_of_view.entry(vi).or_insert_with(|| {
-                        let level = SstTraceLevel::SortedRun(run.id);
-                        add(&mut ssts, view, &segment, level)
-                    });
-                    keys[u].add_candidate(sst);
                 }
+                // Keep the candidate walk cooperative.
+                tokio::task::coop::consume_budget().await;
             }
-            // Keep the candidate walk cooperative.
-            tokio::task::coop::consume_budget().await;
         }
     }
     ssts
@@ -163,13 +170,17 @@ fn view_holds_key(view: &SsTableView, key: &[u8]) -> bool {
 
 /// Group the open keys by the segment that covers them. Trees cover disjoint
 /// keys, so the order of the groups has no effect on a key.
-fn group_by_segment(core: &ManifestCore, keys: &[KeyRead]) -> Vec<(Segment, Vec<usize>)> {
+async fn group_by_segment(core: &ManifestCore, keys: &[KeyRead]) -> Vec<(Segment, Vec<usize>)> {
     let default_segment = core.default_segment();
     // The map key is the tree's Arc pointer cast to `usize` (a raw pointer
     // would make the enclosing future `!Send`).
     let mut group_of: HashMap<usize, usize> = HashMap::new();
     let mut groups: Vec<(Segment, Vec<usize>)> = Vec::new();
     for (idx, KeyRead { key, done, .. }) in keys.iter().enumerate() {
+        if idx % KEYS_PER_YIELD == 0 {
+            // Keep the grouping cooperative.
+            tokio::task::coop::consume_budget().await;
+        }
         if *done {
             continue;
         }

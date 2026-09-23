@@ -33,6 +33,10 @@ use crate::reader::{DbStateReader, ReadTrace, Reader};
 use crate::types::RowEntry;
 
 use candidates::{candidate_ssts, Filters};
+
+/// How many keys a loop handles between two yields to the runtime.
+const KEYS_PER_YIELD: usize = 64;
+
 use key::{BatchKeys, KeyRead};
 use pipeline::Pipeline;
 use sst::SstReader;

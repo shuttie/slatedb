@@ -298,10 +298,11 @@ The reasons behind the steps:
 - The binary search per key and run is the one that `get` uses. A forward
   pass over sorted keys saves little next to the reads, and it needs a
   second copy of the search.
-- The loops over the keys yield to the runtime at a fixed interval, with
-  `consume_budget`. This holds for the plan phase and for each key pass of
-  the read phase. A `get` yields one time per entry. A loop over thousands of keys
-  with no yield blocks the other tasks of the thread.
+- The loops over the keys yield to the runtime with `consume_budget`, one
+  yield per 64 keys at worst. This holds for the plan phase, for each key
+  pass of the read phase, and for the block scan of one read. A loop over
+  thousands of keys with no yield blocks the other tasks of the thread.
+- The batch has no size limit. The caller splits a batch that is too large.
 
 ### Read phase
 
