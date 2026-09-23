@@ -260,7 +260,7 @@ open_keys = sort(dedup(keys))             # copied into Bytes
 # 2. Memory: the write batch, then the memtables, newest first
 for key in open_keys:
     for table in [write_batch, memtable, *immutable_memtables]:
-        entry = table.get(key, max_seq)
+        entry = table.get(key, max_seq)   # the write batch ignores max_seq
         if entry is a value or a tombstone:
             results[key] = entry          # done, the key needs no SST
             break
@@ -334,6 +334,8 @@ arrive(sst, keys, found):
         # waits until every newer SST of the pick arrived.
         for sst in the arrived prefix of inflight[key]:
             for entry in its entries:
+                if entry.seq > max_seq:
+                    continue              # not visible, cannot end the key
                 if entry is a value or a tombstone:
                     results[key] = entry  # done, drop the rest of the pick
                     break
@@ -515,8 +517,10 @@ Limits and cleanup:
 
 - The entries of a key are collected in newest-first order: write batch,
   memtables, then SSTs.
-- The final value comes from the same code that `get` uses: the `max_seq`
-  filter, then the merge operator iterator.
+- An entry above `max_seq` is dropped when it is collected, before the value
+  or tombstone check, as in `get`. Write batch entries skip this filter.
+- The final value comes from the same code that `get` uses: the merge
+  operator iterator.
 - A tombstone gives `None`.
 
 There is no second copy of these rules. The candidate SSTs also pass the same
@@ -529,8 +533,9 @@ the results cannot drift from `get`.
 
 - It reads the write batch first. Entries of the write batch skip the
   `max_seq` filter.
-- It looks up each key in the write batch under the read guard, as `get` does.
-  It never clones the write batch, which can be large.
+- It reads the write batch in one walk under the read guard, and keeps the
+  entries of the batch keys. It never clones the write batch, which can be
+  large.
 - It records each key of the batch with `track_read_keys`, including the keys
   that return `None`.
 
