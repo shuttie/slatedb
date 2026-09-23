@@ -3331,6 +3331,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "foyer",
  "futures",
  "object_store",
  "pprof",

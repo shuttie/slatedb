@@ -8,12 +8,16 @@ use std::{
 };
 
 use clap::{builder::PossibleValue, Args, Parser, Subcommand, ValueEnum};
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCacheBuilder, PsyncIoEngineConfig,
+};
 use object_store::ObjectStore;
 use slatedb::{
     config::{CompressionCodec, MultiGetOptions, Settings},
     db_cache::{
         foyer::{FoyerCache, FoyerCacheOptions},
-        DbCache, SplitCache,
+        foyer_hybrid::FoyerHybridCache,
+        CachedEntry, DbCache, SplitCache,
     },
     Error, IsolationLevel,
 };
@@ -82,6 +86,34 @@ pub(crate) struct DbArgs {
 
     #[arg(
         long,
+        requires = "hybrid_cache_size",
+        help = "Give the block cache and the meta cache a disk tier under this directory. A lookup that misses the memory tier reads the disk before the object store. The memory tiers keep the sizes of --block-cache-size and --meta-cache-size."
+    )]
+    pub(crate) hybrid_cache_path: Option<PathBuf>,
+
+    #[arg(
+        long,
+        requires = "hybrid_cache_path",
+        help = "The size in bytes of the disk tier of the block cache. Needs --hybrid-cache-path."
+    )]
+    pub(crate) hybrid_cache_size: Option<u64>,
+
+    #[arg(
+        long,
+        requires = "hybrid_cache_path",
+        help = "The size in bytes of the disk tier of the meta cache. One eighth of --hybrid-cache-size by default."
+    )]
+    pub(crate) hybrid_meta_cache_size: Option<u64>,
+
+    #[arg(
+        long,
+        requires = "hybrid_cache_path",
+        help = "The block size in bytes of the disk tier. One read of the disk tier reads one block, so a large block over small SST blocks reads more bytes than it needs. 65536 by default."
+    )]
+    pub(crate) hybrid_cache_block_size: Option<usize>,
+
+    #[arg(
+        long,
         help = "Keep the object store disk cache from the configuration file. By default the benchmark disables it, so reads go to the object store.",
         default_value_t = false
     )]
@@ -116,9 +148,34 @@ pub(crate) struct DbArgs {
     pub(crate) delay_ms: Option<u64>,
 }
 
+/// The two caches that the table store reads: one for data blocks, and one
+/// for the filters and the indexes.
+struct ReadCaches {
+    block: Option<Arc<dyn DbCache>>,
+    meta: Option<Arc<dyn DbCache>>,
+}
+
+impl ReadCaches {
+    /// Join the two caches into the one cache that the database takes.
+    fn join(self) -> Arc<dyn DbCache> {
+        Arc::new(
+            SplitCache::new()
+                .with_block_cache(self.block)
+                .with_meta_cache(self.meta)
+                .build(),
+        )
+    }
+}
+
+/// The memory tier of a hybrid cache when its size argument is absent.
+const DEFAULT_HYBRID_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The block size of the disk tier of a hybrid cache.
+const DEFAULT_HYBRID_BLOCK_SIZE: usize = 64 * 1024;
+
 impl DbArgs {
     /// Returns a `(Settings, Option<Arc<dyn DbCache>>)` struct based on DbArgs's arguments.
-    pub(crate) fn config(&self) -> Result<(Settings, Option<Arc<dyn DbCache>>), Error> {
+    pub(crate) async fn config(&self) -> Result<(Settings, Option<Arc<dyn DbCache>>), Error> {
         let mut settings = if let Some(path) = &self.db_options_path {
             Settings::from_file(path)?
         } else {
@@ -135,6 +192,16 @@ impl DbArgs {
             settings.object_store_cache_options.root_folder = None;
         }
 
+        let caches = match &self.hybrid_cache_path {
+            Some(root) => self.hybrid_caches(root).await,
+            None => self.memory_caches(),
+        };
+
+        Ok((settings, Some(caches.join())))
+    }
+
+    /// The block cache and the meta cache in memory.
+    fn memory_caches(&self) -> ReadCaches {
         let block_cache = self.block_cache_size.map(|capacity| {
             Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
                 max_capacity: capacity,
@@ -153,14 +220,79 @@ impl DbArgs {
                 })) as Arc<dyn DbCache>
             })
         };
-        let memory_cache = Some(Arc::new(
-            SplitCache::new()
-                .with_block_cache(block_cache)
-                .with_meta_cache(meta_cache)
-                .build(),
-        ) as Arc<dyn DbCache>);
+        ReadCaches {
+            block: block_cache,
+            meta: meta_cache,
+        }
+    }
 
-        Ok((settings, memory_cache))
+    /// The block cache and the meta cache with a memory tier and a disk tier
+    /// under `root`. Each cache gets its own directory and its own device.
+    async fn hybrid_caches(&self, root: &std::path::Path) -> ReadCaches {
+        let memory = self.block_cache_size.unwrap_or(DEFAULT_HYBRID_MEMORY_BYTES);
+        let disk = self
+            .hybrid_cache_size
+            .expect("--hybrid-cache-path needs --hybrid-cache-size");
+        if self.unified_cache {
+            let cache = self
+                .hybrid_cache("bencher_unified", root.join("unified"), memory, disk)
+                .await;
+            return ReadCaches {
+                block: Some(cache.clone()),
+                meta: Some(cache),
+            };
+        }
+        let block = self
+            .hybrid_cache("bencher_block", root.join("block"), memory, disk)
+            .await;
+        let meta_memory = self.meta_cache_size.unwrap_or(DEFAULT_HYBRID_MEMORY_BYTES);
+        let meta_disk = self.hybrid_meta_cache_size.unwrap_or(disk / 8);
+        let meta = self
+            .hybrid_cache("bencher_meta", root.join("meta"), meta_memory, meta_disk)
+            .await;
+        ReadCaches {
+            block: Some(block),
+            meta: Some(meta),
+        }
+    }
+
+    /// One cache with a memory tier of `memory_bytes` and a disk tier of
+    /// `disk_bytes` in `dir`. The disk tier keeps its data between runs, so a
+    /// second run over the same directory starts warm.
+    async fn hybrid_cache(
+        &self,
+        name: &'static str,
+        dir: PathBuf,
+        memory_bytes: u64,
+        disk_bytes: u64,
+    ) -> Arc<dyn DbCache> {
+        std::fs::create_dir_all(&dir).expect("failed to create the hybrid cache directory");
+        let device = FsDeviceBuilder::new(&dir)
+            .with_capacity(disk_bytes as usize)
+            .build()
+            .expect("failed to open the hybrid cache device");
+        let block_size = self
+            .hybrid_cache_block_size
+            .unwrap_or(DEFAULT_HYBRID_BLOCK_SIZE);
+        let cache = HybridCacheBuilder::new()
+            .with_name(name)
+            .memory(memory_bytes as usize)
+            .with_weighter(|_, value: &CachedEntry| value.size())
+            .storage()
+            .with_io_engine_config(PsyncIoEngineConfig::new())
+            .with_engine_config(BlockEngineConfig::new(device).with_block_size(block_size))
+            .build()
+            .await
+            .expect("failed to build the hybrid cache");
+        info!(
+            name,
+            memory_bytes,
+            disk_bytes,
+            block_size,
+            dir = %dir.display(),
+            "hybrid cache ready"
+        );
+        Arc::new(FoyerHybridCache::new_with_cache(cache))
     }
 
     /// Wraps the object store so the benchmark can count and delay reads.

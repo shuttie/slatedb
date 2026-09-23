@@ -116,7 +116,7 @@ fn write_profile(prefix: &str, profiler: &pprof::ProfilerGuard) -> Result<(), Bo
 }
 
 async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args: BenchmarkDbArgs) {
-    let (mut config, memory_cache) = args.db_args.config().unwrap();
+    let (mut config, db_cache) = args.db_args.config().await.unwrap();
     if args.no_compactor {
         config.compactor_options = None;
     }
@@ -128,8 +128,8 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
         .with_settings(config)
         .with_metrics_recorder(recorder.clone());
 
-    if let Some(memory_cache) = memory_cache {
-        builder = builder.with_db_cache(memory_cache, 0);
+    if let Some(cache) = &db_cache {
+        builder = builder.with_db_cache(cache.clone(), 0);
     }
 
     let db = Arc::new(builder.build().await.unwrap());
@@ -166,6 +166,12 @@ async fn exec_benchmark_db(path: Path, object_store: Arc<dyn ObjectStore>, args:
         wait_for_compaction(&db, Duration::from_secs(30 * 60)).await;
     }
     db.close().await.expect("failed to close db");
+    // The benchmark owns the cache, so SlateDB does not close it. A close
+    // moves the memory tier of a hybrid cache to disk, so the next run over
+    // the same directory starts warm.
+    if let Some(cache) = db_cache {
+        cache.close().await.expect("failed to close the db cache");
+    }
 }
 
 async fn exec_benchmark_compaction(
@@ -212,14 +218,14 @@ async fn exec_benchmark_transaction(
     object_store: Arc<dyn ObjectStore>,
     args: BenchmarkTransactionArgs,
 ) {
-    let (config, memory_cache) = args.db_args.config().unwrap();
+    let (config, db_cache) = args.db_args.config().await.unwrap();
     let write_options = WriteOptions::default();
     let store = args.db_args.wrap_store(object_store);
 
     let mut builder = Db::builder(path.clone(), store).with_settings(config);
 
-    if let Some(memory_cache) = memory_cache {
-        builder = builder.with_db_cache(memory_cache, 0);
+    if let Some(db_cache) = db_cache {
+        builder = builder.with_db_cache(db_cache, 0);
     }
 
     let db = Arc::new(builder.build().await.unwrap());
