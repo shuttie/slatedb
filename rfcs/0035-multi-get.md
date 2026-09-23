@@ -260,19 +260,20 @@ open_keys = sort(dedup(keys))             # copied into Bytes
 # 2. Memory: the write batch, then the memtables, newest first
 for key in open_keys:
     for table in [write_batch, memtable, *immutable_memtables]:
-        entry = table.get(key, max_seq)   # the write batch ignores max_seq
-        if entry is a value or a tombstone:
-            results[key] = entry          # done, the key needs no SST
-            break
-        if entry is a merge operand:
-            operands[key].push(entry)     # the key still needs a base value
+        # all versions of the key, newest first; the write batch ignores max_seq
+        for entry in table.versions(key, max_seq):
+            if entry is a value or a tombstone:
+                results[key] = entry      # done, the key needs no SST
+                break out of both loops
+            if entry is a merge operand:
+                operands[key].push(entry) # the key still needs a base value
 open_keys -= keys in results
 
 # 3. Candidates: the SSTs that can hold each key, newest first
 for sst in view.l0:                       # an L0 SST can hold any key
     for key in open_keys inside sst.key_range:
         candidates[key].push(sst)
-for run in view.sorted_runs:              # a run has one SST per key
+for run in view.sorted_runs:              # versions of a key can span adjacent SSTs
     for key in open_keys:
         for sst in run.ssts_covering(key): # binary search, as in get
             if key inside sst.key_range:   # get skips it too
