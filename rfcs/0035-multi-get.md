@@ -275,7 +275,8 @@ for sst in view.l0:                       # an L0 SST can hold any key
 for run in view.sorted_runs:              # a run has one SST per key
     for key in open_keys:
         for sst in run.ssts_covering(key): # binary search, as in get
-            candidates[key].push(sst)
+            if key inside sst.key_range:   # get skips it too
+                candidates[key].push(sst)
 ```
 
 With segments, step 3 runs inside the segment that covers the key.
@@ -518,8 +519,9 @@ Limits and cleanup:
   filter, then the merge operator iterator.
 - A tombstone gives `None`.
 
-There is no second copy of these rules, so the results cannot drift from
-`get`.
+There is no second copy of these rules. The candidate SSTs also pass the same
+key range check as in `get`, which includes the visible range of a clone. So
+the results cannot drift from `get`.
 
 ### Transactions
 
@@ -582,10 +584,13 @@ errors as a `get`.
 
 - [ ] Manifest format
 - [ ] Checkpoints
-- [ ] Clones
+- [x] Clones
 - [ ] Garbage collection
 - [ ] Database splitting and merging
 - [ ] Multi-writer
+
+A clone can see only part of an SST. A key outside the visible range of an SST
+does not get that SST as a candidate, as in `get`.
 
 ### Compaction
 

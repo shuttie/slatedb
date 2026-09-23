@@ -116,9 +116,15 @@ pub(crate) async fn candidate_ssts(core: &ManifestCore, keys: &mut [KeyRead]) ->
             let mut sst_of_view: BTreeMap<usize, usize> = BTreeMap::new();
             for &u in &group {
                 for vi in run.point_table_idx_covering_key(&keys[u].key) {
+                    let view = &run.sst_views()[vi];
+                    // The last view of a run has no upper bound. `get` drops
+                    // it for a key outside the view's range, so skip it too.
+                    if !view_holds_key(view, &keys[u].key) {
+                        continue;
+                    }
                     let sst = *sst_of_view.entry(vi).or_insert_with(|| {
                         let level = SstTraceLevel::SortedRun(run.id);
-                        add(&mut ssts, &run.sst_views()[vi], &segment, level)
+                        add(&mut ssts, view, &segment, level)
                     });
                     keys[u].add_candidate(sst);
                 }
@@ -174,6 +180,7 @@ mod tests {
     use super::*;
 
     use std::collections::VecDeque;
+    use std::ops::Bound::{Excluded, Unbounded};
 
     use rstest::rstest;
 
@@ -186,25 +193,57 @@ mod tests {
     use crate::multi_get::key::BatchKeys;
     use crate::types::RowEntry;
 
+    /// An SST that holds the keys `first..=last`. A clone sees only the keys
+    /// before `visible_end`.
+    #[derive(Clone, Copy)]
+    struct Sst {
+        first: &'static str,
+        last: &'static str,
+        visible_end: Option<&'static str>,
+    }
+
+    const fn sst(first: &'static str, last: &'static str) -> Sst {
+        Sst {
+            first,
+            last,
+            visible_end: None,
+        }
+    }
+
+    const fn clone_of(sst: Sst, visible_end: &'static str) -> Sst {
+        Sst {
+            visible_end: Some(visible_end),
+            ..sst
+        }
+    }
+
     /// A view with no SST behind it. The walk reads only the key range.
-    fn view(range: &(&str, &str)) -> SsTableView {
+    fn view(sst: &Sst) -> SsTableView {
         let info = SsTableInfo {
-            first_entry: Some(Bytes::copy_from_slice(range.0.as_bytes())),
-            last_entry: Some(Bytes::copy_from_slice(range.1.as_bytes())),
+            first_entry: Some(Bytes::from_static(sst.first.as_bytes())),
+            last_entry: Some(Bytes::from_static(sst.last.as_bytes())),
             ..Default::default()
         };
-        let id = SsTableId::from(ulid::Ulid::new());
-        SsTableView::identity(SsTableHandle::new(id, SST_FORMAT_VERSION_LATEST, info))
+        let ulid = ulid::Ulid::new();
+        let handle = SsTableHandle::new(SsTableId::from(ulid), SST_FORMAT_VERSION_LATEST, info);
+        match sst.visible_end {
+            None => SsTableView::identity(handle),
+            Some(end) => {
+                let visible =
+                    BytesRange::new(Unbounded, Excluded(Bytes::from_static(end.as_bytes())));
+                SsTableView::new_projected(ulid, handle, Some(visible))
+            }
+        }
     }
 
-    fn run(id: u32, ranges: &[(&str, &str)]) -> SortedRun {
-        SortedRun::new(id, ranges.iter().map(view))
+    fn run(id: u32, ssts: &[Sst]) -> SortedRun {
+        SortedRun::new(id, ssts.iter().map(view))
     }
 
-    fn tree(l0: &[(&str, &str)], runs: &[(u32, &[(&str, &str)])]) -> Arc<LsmTreeState> {
+    fn tree(l0: &[Sst], runs: &[(u32, &[Sst])]) -> Arc<LsmTreeState> {
         Arc::new(LsmTreeState {
             l0: l0.iter().map(view).collect::<VecDeque<_>>(),
-            compacted: runs.iter().map(|(id, ranges)| run(*id, ranges)).collect(),
+            compacted: runs.iter().map(|(id, ssts)| run(*id, ssts)).collect(),
             ..Default::default()
         })
     }
@@ -254,34 +293,40 @@ mod tests {
         Arc::from(vec![filter])
     }
 
-    const RUN_2: (u32, &[(&str, &str)]) = (2, &[("a", "f"), ("g", "z")]);
-    const RUN_1: (u32, &[(&str, &str)]) = (1, &[("a", "z")]);
-    const RUN_3: (u32, &[(&str, &str)]) = (3, &[("b", "d"), ("f", "h"), ("h", "k")]);
+    const RUN_2: (u32, &[Sst]) = (2, &[sst("a", "f"), sst("g", "z")]);
+    const RUN_1: (u32, &[Sst]) = (1, &[sst("a", "z")]);
+    const RUN_3: (u32, &[Sst]) = (3, &[sst("b", "d"), sst("f", "h"), sst("h", "k")]);
+    const RUN_4: (u32, &[Sst]) = (4, &[clone_of(sst("a", "z"), "h")]);
 
     #[rstest]
     #[case::no_ssts(&[], &[], &["a"], &[false], vec![])]
     #[case::l0_range_prune(
-        &[("a", "c"), ("m", "p")], &[], &["b", "n", "z"], &[false; 3],
+        &[sst("a", "c"), sst("m", "p")], &[], &["b", "n", "z"], &[false; 3],
         vec![("l0:a", vec![0]), ("l0:m", vec![1])],
     )]
     #[case::l0_first_then_runs_in_order(
-        &[("a", "z")], &[RUN_2, RUN_1], &["b", "h"], &[false; 2],
+        &[sst("a", "z")], &[RUN_2, RUN_1], &["b", "h"], &[false; 2],
         vec![("l0:a", vec![0, 1]), ("sr2:a", vec![0]), ("sr2:g", vec![1]), ("sr1:a", vec![0, 1])],
     )]
     #[case::resolved_key_has_no_candidates(
-        &[("a", "z")], &[RUN_2], &["b", "h"], &[true, false],
+        &[sst("a", "z")], &[RUN_2], &["b", "h"], &[true, false],
         vec![("l0:a", vec![1]), ("sr2:g", vec![1])],
     )]
-    // Two views share the border key `h`, and the key reads both. The last
-    // view of a run has no upper bound, so it also gets `z`.
+    // Two views share the border key `h`, and the key reads both. `z` is
+    // past the last key of the run, so it gets no view.
     #[case::border_key_has_two_views(
         &[], &[RUN_3], &["a", "c", "h", "z"], &[false; 4],
-        vec![("sr3:b", vec![1]), ("sr3:f", vec![2]), ("sr3:h", vec![2, 3])],
+        vec![("sr3:b", vec![1]), ("sr3:f", vec![2]), ("sr3:h", vec![2])],
+    )]
+    // The clone holds `i`, but its view ends before `h`, so `get` skips it.
+    #[case::clone_hides_keys_past_its_view(
+        &[], &[RUN_4], &["c", "i"], &[false; 2],
+        vec![("sr4:a", vec![0])],
     )]
     #[tokio::test]
     async fn should_list_candidate_ssts_newest_first(
-        #[case] l0: &[(&str, &str)],
-        #[case] runs: &[(u32, &[(&str, &str)])],
+        #[case] l0: &[Sst],
+        #[case] runs: &[(u32, &[Sst])],
         #[case] keys: &[&str],
         #[case] resolved: &[bool],
         #[case] expected: Vec<(&str, Vec<usize>)>,
@@ -309,15 +354,15 @@ mod tests {
     async fn should_list_each_key_inside_its_segment() {
         let mut core = ManifestCore::new();
         // The default tree must not take part when segments are set.
-        core.tree = tree(&[("a", "z")], &[]);
+        core.tree = tree(&[sst("a", "z")], &[]);
         core.segments = vec![
             Segment {
                 prefix: Bytes::from_static(b"a/"),
-                tree: tree(&[("a/1", "a/9")], &[]),
+                tree: tree(&[sst("a/1", "a/9")], &[]),
             },
             Segment {
                 prefix: Bytes::from_static(b"b/"),
-                tree: tree(&[], &[(7, &[("b/1", "b/9")])]),
+                tree: tree(&[], &[(7, &[sst("b/1", "b/9")])]),
             },
         ];
 
@@ -344,7 +389,7 @@ mod tests {
         #[case] filter_keys: Option<Vec<&str>>,
         #[case] expected: Option<bool>,
     ) {
-        let mut sst = BatchSst::new(&view(&("a", "z")), Bytes::new(), SstTraceLevel::L0);
+        let mut sst = BatchSst::new(&view(&sst("a", "z")), Bytes::new(), SstTraceLevel::L0);
         sst.filters = match filter_keys {
             None => Filters::NotLoaded,
             Some(keys) if keys.is_empty() => Filters::Loaded(Arc::from([])),
