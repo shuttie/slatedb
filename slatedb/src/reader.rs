@@ -1766,11 +1766,10 @@ mod tests {
         vec![l0_value(b"v0", 50, 0), l0_value(b"v1", 60, 1), l0_value(b"v2", 70, 2)],
         Some(65), b"v1", 2, 3 + 2 + 2,
     )]
-    // Round 1 finds a merge operand. It removes the limit, so round 2 reads
-    // both older SSTs, and there is no round 3.
-    #[case::operand_removes_the_limit(
+    // Merge operands do not change the limit, so each round reads one SST.
+    #[case::operand_keeps_the_limit(
         vec![l0_value(b"v0", 50, 0), l0_merge(b"+1", 60, 1), l0_merge(b"+2", 70, 2)],
-        None, b"v0+1+2", 2, 3 + 2 + 2 * 2,
+        None, b"v0+1+2", 3, 3 + 3 * 2,
     )]
     #[tokio::test]
     async fn test_multi_get_rounds(

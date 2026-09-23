@@ -127,33 +127,28 @@ impl KeyRead {
         }
     }
 
-    /// An open key holds only merge operands.
-    pub(crate) fn has_operand(&self) -> bool {
-        !self.wb.is_empty() || !self.acc.is_empty()
-    }
-
     /// Walk the candidates newest first and pick the next step, as `get`
-    /// does. The first read takes one SST whose filters pass the key, and
-    /// each later read takes `lookahead` of them. A key with a merge operand
-    /// needs its base value, so it has no limit.
+    /// does. The first read takes one SST whose filters pass the key. Each
+    /// later read takes the passing SSTs of the next `lookahead` candidates.
     ///
     /// `filter` says if the filters of an SST pass the key, or `None` when
     /// they are not loaded. An SST with no loaded filters does not count
     /// against the limit, because the pick only loads its filters. An SST
-    /// whose filters reject the key leaves the candidates.
+    /// whose filters reject the key counts and leaves the candidates. The
+    /// walk does not stop before the first pass or load.
     pub(crate) fn pick(
         &mut self,
         lookahead: usize,
         mut filter: impl FnMut(usize, &Bytes) -> Option<bool>,
     ) -> Pick {
-        let mut left = match (self.has_operand(), self.rounds) {
-            (true, _) => usize::MAX,
-            (false, 0) => 1,
-            (false, _) => lookahead.max(1),
+        let mut left = if self.rounds == 0 {
+            1
+        } else {
+            lookahead.max(1)
         };
         let mut load = Vec::new();
         let mut end = 0;
-        while end < self.candidates.len() && left > 0 {
+        while end < self.candidates.len() && (left > 0 || end == 0) {
             let candidate = &mut self.candidates[end];
             if !candidate.passed {
                 match filter(candidate.sst, &self.key) {
@@ -164,12 +159,13 @@ impl KeyRead {
                     }
                     Some(false) => {
                         self.candidates.remove(end);
+                        left = left.saturating_sub(1);
                         continue;
                     }
                     Some(true) => candidate.passed = true,
                 }
             }
-            left -= 1;
+            left = left.saturating_sub(1);
             end += 1;
         }
         if !load.is_empty() {
@@ -269,10 +265,11 @@ mod tests {
     #[case::first_read_takes_one(&[P, P, P], 0, 4, false, Pick::Read(vec![0]))]
     #[case::later_read_takes_lookahead(&[P, P, P, P, P], 1, 4, false, Pick::Read(vec![0, 1, 2, 3]))]
     #[case::lookahead_0_acts_as_1(&[P, P], 1, 0, false, Pick::Read(vec![0]))]
-    #[case::operand_removes_the_limit(&[P, P, P], 0, 1, true, Pick::Read(vec![0, 1, 2]))]
+    #[case::operand_keeps_the_limit(&[P, P, P], 0, 4, true, Pick::Read(vec![0]))]
     #[case::not_loaded_is_free(&[N, N, P, P], 0, 4, false, Pick::Load(vec![0, 1]))]
     #[case::all_not_loaded_loads_all(&[N, N, N], 0, 4, false, Pick::Load(vec![0, 1, 2]))]
-    #[case::rejects_do_not_count(&[P, R, P, P], 1, 2, false, Pick::Read(vec![0, 2]))]
+    #[case::rejects_count(&[P, R, P, P], 1, 2, false, Pick::Read(vec![0]))]
+    #[case::rejects_only_move_on(&[R, R, P, P], 1, 2, false, Pick::Read(vec![2]))]
     #[case::all_rejected(&[R, R], 0, 4, false, Pick::Done)]
     fn should_pick_like_get(
         #[case] filters: &[Option<bool>],

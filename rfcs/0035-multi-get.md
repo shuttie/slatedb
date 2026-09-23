@@ -226,9 +226,9 @@ pub struct MultiGetOptions {
 
     /// Max object store requests of one batch in flight. Default: 256.
     pub max_fetch_tasks: usize,
-    /// Max known-positive SSTs that a key reads in its second round and
-    /// later. The first round always reads one. Default: 4, the lookahead
-    /// of `get`.
+    /// Max candidate SSTs that a key walks in its second round and later.
+    /// It reads the positive ones. The first round always reads one.
+    /// Default: 4, the lookahead of `get`.
     pub lookahead: usize,
     /// Two blocks go into one ranged GET when the gap between them is at
     /// most this many bytes. With 0, only adjacent blocks merge.
@@ -246,6 +246,7 @@ Notes on the fields:
   SSTs makes such a batch slower than `join_all` over gets.
 - `lookahead` trades requests for latency. A value of 1 gives the fewest
   requests. It matters only for keys with more than one positive filter.
+  A workload with long merge chains can raise it to get fewer rounds.
 - Block merging helps when the keys of a batch cluster, for example under one
   prefix. Random keys in a 1 GiB SST almost never share a range.
 
@@ -405,20 +406,19 @@ The rule is a trade between requests and round trips:
 - All SSTs at once need one round trip, but they download blocks of old
   versions that the newest SST already answers.
 
-`pick_next` reads as few SSTs as it can, with two exceptions. It checks the
+`pick_next` reads as few SSTs as it can, with one exception. It checks the
 filter of each SST that it walks past, one time per key and SST:
 
 ```text
 pick_next(key):                           # candidates newest first
     limit = 1 if this is the first round of the key else options.lookahead
-    if the key has a merge operand:
-        limit = no limit                  # exception 2
     load, walked = [], []
-    for sst in candidates[key], while limit > 0:
+    for sst in candidates[key], while limit > 0 or nothing was walked or loaded:
         if the filter of sst is not loaded:
-            load.push(sst)                # exception 1: free
+            load.push(sst)                # the exception: free
         elif the filter rejects the key:
             remove sst from candidates[key]
+            limit -= 1                    # as in the window of get
         else:                             # the filter passes the key
             walked.push(sst)
             limit -= 1
@@ -454,7 +454,7 @@ The reasons:
   with frequent updates has old versions in older SSTs, and their filters are
   right to answer "present". C in the example can hold an old version of K.
   To read it is a waste, because B has the newer one.
-- Exception 1: an SST with no loaded filter does not count. The batch must
+- The exception: an SST with no loaded filter does not count. The batch must
   load its filter first, and the answer is "negative" 99 times out of 100.
   The common case is a new L0 SST that a `DbReader` has never seen. This SST
   is the newest candidate of each key of the batch. If it counted, the first
@@ -465,12 +465,13 @@ The reasons:
   requests of a `get` loop.
 - A filter in the cache is a load too, but it sends no request. It costs
   one turn of the event loop before the key reads.
-- Exception 2: a merge operand removes the limit. The key needs its base
-  value, so it must read each SST down to the base in any case. A counter
-  with operands in 10 SSTs takes 2 rounds and not 4.
+- A merge operand does not change the limit, because it does not change the
+  walk of `get`. A counter with operands in 10 SSTs takes 4 rounds, as in
+  `get`.
 - A `get` makes the same choices. It loads the filter of each SST above the
-  one that answers, and after the first miss it reads 4 sources at a time. So
-  the batch sends almost the same requests as a loop.
+  one that answers, and after the first miss it walks 4 sources at a time. A
+  source with a negative filter takes one of the 4 places. So the batch sends
+  almost the same requests as a loop.
 
 How many rounds a key takes:
 

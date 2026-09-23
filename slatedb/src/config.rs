@@ -389,9 +389,10 @@ pub struct MultiGetOptions {
     pub coalesce_gap_bytes: usize,
     /// The upper size of one merged ranged GET. The default is 4 MiB.
     pub max_coalesced_bytes: usize,
-    /// How many SSTs with a positive filter a key reads in one round, from
-    /// the second round on. The first round always reads one. A value of 0
-    /// acts as 1. The default is 4, the lookahead of `get`.
+    /// How many candidate SSTs a key walks in one round, from the second
+    /// round on. It reads the ones with a positive filter. The first round
+    /// always reads one. A value of 0 acts as 1. The default is 4, the
+    /// lookahead of `get`.
     pub lookahead: usize,
 }
 
