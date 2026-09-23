@@ -2,6 +2,8 @@
 //!
 //! [`SstReader::read`] loads the index, merges the wanted blocks into
 //! ranges, reads the ranges in parallel, and scans the blocks for each key.
+//! The keys of a range come back when that range is read, so a key does not
+//! wait for the slowest range of the SST.
 //! The filters, the index, and the blocks go through the cache of the
 //! [`TableStore`], so a warm SST sends no object store request.
 //!
@@ -15,7 +17,9 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::future::try_join_all;
+use futures::future::{self, try_join_all};
+use futures::stream::{self, FuturesUnordered};
+use futures::{FutureExt, Stream, TryStreamExt};
 use log::error;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::{JoinError, JoinSet};
@@ -44,8 +48,10 @@ pub(crate) struct KeyEntries {
     pub(crate) entries: Vec<RowEntry>,
 }
 
-/// The result of [`SstReader::read`] for one SST.
+/// One result of [`SstReader::read`]: the entries of some keys of the read.
 pub(crate) struct SstEntries {
+    /// The slots of the keys that this result answers.
+    pub(crate) keys: Vec<usize>,
     /// The keys that the SST holds. A key that it does not hold has no entry.
     pub(crate) found: Vec<KeyEntries>,
     /// The index that the read used. The batch keeps it for later reads.
@@ -118,47 +124,48 @@ impl<'a> SstReader<'a> {
     /// Read `keys` from an SST whose filters passed them. `index` is the
     /// index from an earlier read of the batch. `filtered` says that the SST
     /// has filters, for the false positive stats.
-    pub(crate) async fn read(
+    ///
+    /// The stream yields one result per [`BlockFetch`], when its ranges are
+    /// read. Each key is in exactly one result.
+    pub(crate) fn read(
         self,
         sst: SstTarget,
         index: Option<Arc<SsTableIndexOwned>>,
         filtered: bool,
         keys: Vec<PendingKey>,
-    ) -> Result<SstEntries, SlateDBError> {
-        let index = match index {
-            Some(index) => index,
-            None => {
-                let _permit = self.permit().await;
-                let segment = Some(sst.segment.clone());
-                self.table_store
-                    .read_index(
-                        &sst.handle,
-                        true,
-                        segment,
-                        self.read_trace,
-                        Some(&sst.level),
-                    )
-                    .await?
+    ) -> impl Stream<Item = Result<SstEntries, SlateDBError>> + 'a {
+        let fetches = async move {
+            let index = match index {
+                Some(index) => index,
+                None => {
+                    let _permit = self.permit().await;
+                    let segment = Some(sst.segment.clone());
+                    self.table_store
+                        .read_index(
+                            &sst.handle,
+                            true,
+                            segment,
+                            self.read_trace,
+                            Some(&sst.level),
+                        )
+                        .await?
+                }
+            };
+            if index.borrow().block_meta().is_empty() {
+                let keys = keys.iter().map(|key| key.idx).collect();
+                let found = Vec::new();
+                let empty = SstEntries { keys, found, index };
+                let empty = future::ready(Ok(empty)).boxed();
+                return Ok::<_, SlateDBError>(FuturesUnordered::from_iter([empty]));
             }
+            let keys = key_blocks(keys, &index);
+            let fetches = self.cached_blocks(sst, index, keys, filtered).await;
+            Ok(fetches
+                .into_iter()
+                .map(|fetch| fetch.fetch().boxed())
+                .collect())
         };
-        if index.borrow().block_meta().is_empty() {
-            let found = Vec::new();
-            return Ok(SstEntries { found, index });
-        }
-        let keys = key_blocks(keys, &index);
-        let fetch = self.cached_blocks(sst, index.clone(), keys, filtered).await;
-        let found = if fetch.runs.is_empty() {
-            // All blocks are in the cache, so the scan runs here.
-            fetch.run().await?
-        } else {
-            // The fetch, the decode, and the scan run on another thread. A
-            // drop of `task` aborts the task.
-            let mut task = JoinSet::new();
-            task.spawn(fetch.run());
-            let joined = task.join_next().await.expect("one task was spawned");
-            joined.map_err(fetch_join_error)??
-        };
-        Ok(SstEntries { found, index })
+        stream::once(fetches).try_flatten()
     }
 
     async fn permit(&self) -> SemaphorePermit<'a> {
@@ -171,13 +178,17 @@ impl<'a> SstReader<'a> {
     /// Take the blocks of `keys` from the cache, and merge the block ranges
     /// of the other blocks into runs. A cache lookup here is cheaper than
     /// the load path of `read_blocks_using_index` for one block.
+    ///
+    /// Returns one fetch per group of runs. A group is one run, or more runs
+    /// when the missing blocks of a key are in more than one run. The keys
+    /// with all blocks in the cache go into a fetch with no run.
     async fn cached_blocks(
         self,
         sst: SstTarget,
         index: Arc<SsTableIndexOwned>,
         keys: Vec<KeyBlocks>,
         filtered: bool,
-    ) -> BlockFetch {
+    ) -> Vec<BlockFetch> {
         let mut needed: Vec<usize> = Vec::new();
         for key in &keys {
             needed.extend(key.blocks.clone());
@@ -196,7 +207,7 @@ impl<'a> SstReader<'a> {
             }
         }
 
-        let runs = coalesce_runs(
+        let runs: Vec<Vec<usize>> = coalesce_runs(
             &missing,
             |blocks| {
                 self.table_store
@@ -212,24 +223,70 @@ impl<'a> SstReader<'a> {
             missing[start..end].to_vec()
         })
         .collect();
-        BlockFetch {
-            table_store: self.table_store.clone(),
-            requests: self.requests.clone(),
-            db_stats: self.db_stats.clone(),
-            cache_blocks: self.options.cache_blocks,
-            sst,
-            index,
-            keys,
-            blocks,
-            runs,
-            filtered,
+
+        // The runs that hold the missing blocks of each key.
+        let run_of = |b: usize| runs.partition_point(|run| run[run.len() - 1] < b);
+        let key_runs: Vec<Option<Range<usize>>> = keys
+            .iter()
+            .map(|key| {
+                let mut own = key
+                    .blocks
+                    .clone()
+                    .filter(|b| missing.binary_search(b).is_ok());
+                let first = own.next()?;
+                let last = own.next_back().unwrap_or(first);
+                Some(run_of(first)..run_of(last) + 1)
+            })
+            .collect();
+        // A run starts a new group, unless a key needs it and the run before.
+        let mut starts = vec![true; runs.len()];
+        for key_run in key_runs.iter().flatten() {
+            starts[key_run.start + 1..key_run.end].fill(false);
         }
+        // Group 0 holds the keys with all blocks in the cache.
+        let mut group = 0;
+        let group_of_run: Vec<usize> = starts
+            .iter()
+            .map(|&start| {
+                group += usize::from(start);
+                group
+            })
+            .collect();
+
+        let mut fetches: Vec<BlockFetch> = (0..=group)
+            .map(|_| BlockFetch {
+                table_store: self.table_store.clone(),
+                requests: self.requests.clone(),
+                db_stats: self.db_stats.clone(),
+                cache_blocks: self.options.cache_blocks,
+                sst: sst.clone(),
+                index: index.clone(),
+                keys: Vec::new(),
+                blocks: BTreeMap::new(),
+                runs: Vec::new(),
+                filtered,
+            })
+            .collect();
+        for (run, &group) in runs.into_iter().zip(&group_of_run) {
+            fetches[group].runs.push(run);
+        }
+        for (key, key_run) in keys.into_iter().zip(key_runs) {
+            let fetch = &mut fetches[key_run.map_or(0, |run| group_of_run[run.start])];
+            for b in key.blocks.clone() {
+                if let Some(block) = blocks.get(&b) {
+                    fetch.blocks.insert(b, block.clone());
+                }
+            }
+            fetch.keys.push(key);
+        }
+        fetches.retain(|fetch| !fetch.keys.is_empty());
+        fetches
     }
 }
 
-/// The rest of one SST read after the cache pass: fetch the missing blocks,
-/// then scan the blocks of each key. It owns its data, so it can run as a
-/// task.
+/// The rest of one SST read after the cache pass, for some keys of the read:
+/// fetch their missing blocks, then scan the blocks of each key. It owns its
+/// data, so it can run as a task.
 struct BlockFetch {
     table_store: Arc<TableStore>,
     requests: Arc<Semaphore>,
@@ -248,9 +305,22 @@ struct BlockFetch {
 }
 
 impl BlockFetch {
+    /// Run the fetch. With no missing block, the scan runs on the batch
+    /// task. Otherwise the fetch, the decode, and the scan run on another
+    /// thread, and a drop of the future aborts that task.
+    async fn fetch(self) -> Result<SstEntries, SlateDBError> {
+        if self.runs.is_empty() {
+            return self.run().await;
+        }
+        let mut task = JoinSet::new();
+        task.spawn(self.run());
+        let joined = task.join_next().await.expect("one task was spawned");
+        joined.map_err(fetch_join_error)?
+    }
+
     /// Read all runs in parallel, then scan. A key that the filters passed
     /// and that the SST does not hold is a filter false positive.
-    async fn run(mut self) -> Result<Vec<KeyEntries>, SlateDBError> {
+    async fn run(mut self) -> Result<SstEntries, SlateDBError> {
         let this = &self;
         let fetched = try_join_all(this.runs.iter().map(|run| async move {
             let _permit = this
@@ -301,7 +371,9 @@ impl BlockFetch {
                 self.db_stats.sst_filter_point_false_positives.increment(1);
             }
         }
-        Ok(found)
+        let keys = self.keys.iter().map(|key| key.key.idx).collect();
+        let index = self.index;
+        Ok(SstEntries { keys, found, index })
     }
 }
 
@@ -518,6 +590,35 @@ mod tests {
             index: Option<Arc<SsTableIndexOwned>>,
             options: MultiGetOptions,
         ) -> Vec<usize> {
+            let results = self.results(keys, index, options).await;
+            let found = results.iter().flat_map(|result| &result.found);
+            let mut keys: Vec<usize> = found.map(|key| key.idx).collect();
+            keys.sort_unstable();
+            keys
+        }
+
+        /// Read `keys` and return the keys of each result, sorted.
+        async fn groups(&self, keys: &[usize], options: MultiGetOptions) -> Vec<Vec<usize>> {
+            let results = self.results(keys, None, options).await;
+            let mut groups: Vec<Vec<usize>> = results
+                .into_iter()
+                .map(|result| {
+                    let mut keys = result.keys;
+                    keys.sort_unstable();
+                    keys
+                })
+                .collect();
+            groups.sort_unstable();
+            groups
+        }
+
+        /// Read `keys` and return all results of the read.
+        async fn results(
+            &self,
+            keys: &[usize],
+            index: Option<Arc<SsTableIndexOwned>>,
+            options: MultiGetOptions,
+        ) -> Vec<SstEntries> {
             let requests = Arc::new(Semaphore::new(options.max_fetch_tasks));
             let read_trace = ReadTrace::new(None);
             let db_stats = DbStats::new(&MetricsRecorderHelper::noop());
@@ -529,10 +630,7 @@ mod tests {
                 db_stats: &db_stats,
             };
             let read = reader.read(self.target(), index, true, pending(keys));
-            let found = read.await.unwrap().found;
-            let mut keys: Vec<usize> = found.iter().map(|key| key.idx).collect();
-            keys.sort_unstable();
-            keys
+            read.try_collect().await.unwrap()
         }
 
         /// The index, loaded so that only block reads go to the object store.
@@ -552,21 +650,23 @@ mod tests {
     }
 
     #[rstest]
-    #[case::scattered_blocks(&[0, 100, 198], 0, 3)]
-    #[case::near_blocks_merge(&[0, 20, 40], 64 * 1024, 1)]
-    #[case::near_blocks_with_no_merge(&[0, 20, 40], 0, 3)]
-    #[case::two_keys_in_one_block(&[0, 2], 0, 1)]
+    #[case::scattered_blocks(&[0, 100, 198], 0, 3, vec![vec![0], vec![100], vec![198]])]
+    #[case::near_blocks_merge(&[0, 20, 40], 64 * 1024, 1, vec![vec![0, 20, 40]])]
+    #[case::near_blocks_with_no_merge(&[0, 20, 40], 0, 3, vec![vec![0], vec![20], vec![40]])]
+    #[case::two_keys_in_one_block(&[0, 2], 0, 1, vec![vec![0, 2]])]
     #[tokio::test]
     async fn should_send_one_get_per_range(
         #[case] keys: &[usize],
         #[case] coalesce_gap_bytes: usize,
         #[case] expected_block_gets: usize,
+        #[case] expected_groups: Vec<Vec<usize>>,
     ) {
         let fx = fixture(false).await;
         let options = MultiGetOptions::default().with_coalesce_gap_bytes(coalesce_gap_bytes);
-        let found = fx.read(keys, options).await;
+        let groups = fx.groups(keys, options).await;
 
-        assert_eq!(found, keys);
+        // Each range returns its keys in its own result.
+        assert_eq!(groups, expected_groups);
         // One GET for the index, and the block ranges.
         assert_eq!(fx.gets(), 1 + expected_block_gets);
     }

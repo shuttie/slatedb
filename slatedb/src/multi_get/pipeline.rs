@@ -2,22 +2,21 @@
 //!
 //! Each open key reads its candidates newest first, in rounds. One round is
 //! one pick ([`KeyRead::pick`]) and the reads of the picked SSTs. The keys do
-//! not wait for each other: when the read of one SST returns, the keys of
-//! that read make their next pick at once. A batch that reads in lockstep
+//! not wait for each other: when a range of an SST read returns, the keys of
+//! that range make their next pick at once. A batch that reads in lockstep
 //! pays the tail latency of the object store one time per step. A pipeline
 //! pays it about one time.
 //!
-//! The [`Pipeline`] drives an event loop over the futures of its filter
-//! loads and reads. The futures run on the task of the batch, so a drop of
+//! The [`Pipeline`] drives an event loop over the streams of its filter
+//! loads and reads. The streams run on the task of the batch, so a drop of
 //! the batch cancels them.
 
 use std::collections::BTreeMap;
 use std::mem;
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
-use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
+use futures::stream::{self, BoxStream, SelectAll};
+use futures::{StreamExt, TryStreamExt};
 
 use crate::error::SlateDBError;
 use crate::filter_policy::NamedFilter;
@@ -27,7 +26,7 @@ use super::candidates::{BatchSst, Filters};
 use super::key::{KeyRead, Pick};
 use super::sst::{PendingKey, SstEntries, SstReader};
 
-/// What one future of the read phase returns.
+/// What one stream of the read phase yields.
 enum Event {
     /// The filters of one SST.
     Filters {
@@ -35,13 +34,11 @@ enum Event {
         sst: usize,
         filters: Arc<[NamedFilter]>,
     },
-    /// The read of one SST for some of its keys.
+    /// The read of one SST for some of its keys. A key that the SST does not
+    /// hold has no entries, but it still arrives.
     Read {
         /// Index into [`Pipeline::ssts`].
         sst: usize,
-        /// The keys that the read got. A key that the SST does not hold has
-        /// no entries, but it still arrives.
-        keys: Vec<usize>,
         entries: SstEntries,
     },
 }
@@ -58,7 +55,7 @@ pub(crate) struct Pipeline<'a> {
     /// of each turn of the loop, so the keys of one turn share a read.
     ready: BTreeMap<usize, Vec<PendingKey>>,
     /// The filter loads and the reads in flight.
-    events: FuturesUnordered<BoxFuture<'a, Result<Event, SlateDBError>>>,
+    events: SelectAll<BoxStream<'a, Result<Event, SlateDBError>>>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -74,7 +71,7 @@ impl<'a> Pipeline<'a> {
             ssts,
             max_seq,
             ready: BTreeMap::new(),
-            events: FuturesUnordered::new(),
+            events: SelectAll::new(),
         }
     }
 
@@ -92,7 +89,7 @@ impl<'a> Pipeline<'a> {
         while let Some(event) = self.events.next().await {
             match event? {
                 Event::Filters { sst, filters } => self.on_filters(sst, filters).await,
-                Event::Read { sst, keys, entries } => self.on_read(sst, keys, entries).await,
+                Event::Read { sst, entries } => self.on_read(sst, entries).await,
             }
             self.start_reads();
         }
@@ -140,7 +137,7 @@ impl<'a> Pipeline<'a> {
                     let filters = load.await?;
                     Ok(Event::Filters { sst, filters })
                 };
-                self.events.push(event.boxed());
+                self.events.push(stream::once(event).boxed());
             }
             Filters::Loaded(_) => unreachable!("a pick loads only filters that are not loaded"),
         }
@@ -152,19 +149,11 @@ impl<'a> Pipeline<'a> {
             let batch_sst = &self.ssts[sst];
             let target = batch_sst.target.clone();
             let index = batch_sst.index.clone();
-            let idxs: Vec<usize> = keys.iter().map(|pk| pk.idx).collect();
             let read = self
                 .reader
                 .read(target, index, batch_sst.has_filters(), keys);
-            let event = async move {
-                let entries = read.await?;
-                Ok(Event::Read {
-                    sst,
-                    keys: idxs,
-                    entries,
-                })
-            };
-            self.events.push(event.boxed());
+            let events = read.map_ok(move |entries| Event::Read { sst, entries });
+            self.events.push(events.boxed());
         }
     }
 
@@ -188,14 +177,14 @@ impl<'a> Pipeline<'a> {
 
     /// Apply the read of one SST to its keys. A key whose pick is complete
     /// makes its next pick.
-    async fn on_read(&mut self, sst: usize, keys: Vec<usize>, entries: SstEntries) {
+    async fn on_read(&mut self, sst: usize, entries: SstEntries) {
         self.ssts[sst].index = Some(entries.index);
         let mut found: BTreeMap<usize, Vec<RowEntry>> = entries
             .found
             .into_iter()
             .map(|key| (key.idx, key.entries))
             .collect();
-        for u in keys {
+        for u in entries.keys {
             let entries = found.remove(&u).unwrap_or_default();
             let key = &mut self.keys[u];
             key.arrive(sst, entries, self.max_seq);

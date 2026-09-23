@@ -143,8 +143,8 @@ to repeat this work for each key:
   checks the filter of each SST when it reaches it, as `get` does. In its
   first round, each open key reads only the newest SST whose filter passes
   it. A key goes to its next round only when that SST did not answer it.
-  The keys do not wait for each other: when the read of one SST returns,
-  its keys make their next pick at once.
+  The keys do not wait for each other: when one range of an SST read
+  returns, its keys make their next pick at once.
 
 The motivation of such iterative design is that it's not possible to build a full deterministic plan
 of the multi_get batch read.
@@ -306,7 +306,7 @@ The reasons behind the steps:
 ### Read phase
 
 The read phase is an event loop. Each open key makes a pick, and the picked
-SSTs are read. When a read returns, the keys of that read apply its entries
+SSTs are read. When a range returns, the keys of that range apply its entries
 and make their next pick. A key that is done leaves the loop. The loop ends
 when no read is in flight.
 
@@ -330,7 +330,7 @@ schedule(key):                            # the key is open and idle
 
 start_reads():                            # at the end of each turn
     for (sst, keys) in take(ready):
-        events.push(read_sst(sst, keys))  # -> Read event
+        events.push(read_sst(sst, keys))  # -> one Read event per range
 
 arrive(sst, keys, found):
     for key in keys:
@@ -362,18 +362,24 @@ run():
         start_reads()
 
 
-read_sst(sst, keys):                      # a future on the batch task
+read_sst(sst, keys):                      # a stream on the batch task
     index  = load_index(sst)              # cache, or kept in loaded
     blocks = the block of each key, from the index
     ranges = merge_adjacent(the blocks not in the cache)
                                           # coalesce_gap_bytes
+    yield the keys with all blocks in the cache
     for range in ranges, all in parallel: # not one after the other
         data = read range                 # one GET under the
                                           # semaphore: max_fetch_tasks
         decode and cache the key blocks of range, not the gap blocks
         for key in keys inside range:
             seek the key, collect its entries
+        yield the keys of range           # a key does not wait for
+                                          # the other ranges
 ```
+
+A key whose blocks are in two ranges waits for both. The two ranges then
+return their keys together.
 
 Why an event loop and not a loop of steps over all keys:
 
