@@ -387,7 +387,7 @@ pub struct MultiGetOptions {
     /// is at most this many bytes. With 0, only adjacent blocks merge. The
     /// default is 64 KiB.
     pub coalesce_gap_bytes: usize,
-    /// The upper size of one merged ranged GET. The default is 4 MiB.
+    /// The upper size of one merged ranged GET. The default is 512 KiB.
     pub max_coalesced_bytes: usize,
     /// How many candidate SSTs a key walks in one round, from the second
     /// round on. It reads the ones with a positive filter. The first round
@@ -406,7 +406,7 @@ impl Default for MultiGetOptions {
             tracing_options: None,
             max_fetch_tasks: 256,
             coalesce_gap_bytes: 64 * 1024,
-            max_coalesced_bytes: 4 * 1024 * 1024,
+            max_coalesced_bytes: 512 * 1024,
             lookahead: 4,
         }
     }

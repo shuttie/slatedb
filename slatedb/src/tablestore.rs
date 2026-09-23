@@ -911,6 +911,54 @@ impl TableStore {
         Ok(blocks_read)
     }
 
+    /// Reads the byte range from the first to the last of `blocks` with one
+    /// GET, and decodes only `blocks`. The blocks between them are not
+    /// decoded or cached. `blocks` is sorted and not empty. Unlike
+    /// [`Self::read_blocks_using_index`], it does not look in the cache.
+    pub(crate) async fn read_sparse_blocks(
+        &self,
+        handle: &SsTableHandle,
+        index: &SsTableIndexOwned,
+        blocks: &[usize],
+        cache_blocks: bool,
+        segment: Option<Bytes>,
+    ) -> Result<Vec<Arc<Block>>, SlateDBError> {
+        let path = self.path(&handle.id);
+        let read = read_with_validation_retry(
+            ObjectStoreCallTag::new_with_segment(self.kind, SstType::from(&handle.id), segment),
+            |tag| {
+                let obj = ReadOnlyObject {
+                    object_store: self.object_store.clone(),
+                    path: path.clone(),
+                    tag,
+                };
+                async move {
+                    self.sst_format
+                        .read_sparse_blocks(&handle.info, index, blocks, &obj)
+                        .await
+                        .map_err(|e| e.with_path(&obj.path))
+                }
+            },
+        )
+        .await?;
+        let read: Vec<Arc<Block>> = read.into_iter().map(Arc::new).collect();
+
+        if cache_blocks {
+            if let Some(cache) = self.cache_for_reads() {
+                let index = index.borrow();
+                join_all(blocks.iter().zip(&read).map(|(&block_num, block)| {
+                    let offset = index.block_meta().get(block_num).offset();
+                    cache.insert(
+                        (handle.id, offset).into(),
+                        CachedEntry::with_block(block.clone()),
+                    )
+                }))
+                .await;
+            }
+        }
+        Ok(read)
+    }
+
     /// Returns the filters of an SST if they are in the cache. Never loads.
     /// An SST with no filter gives an empty slice, as [`Self::read_filters`] does.
     pub(crate) async fn cached_filters(

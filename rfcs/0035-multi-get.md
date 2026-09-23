@@ -121,7 +121,7 @@ to repeat this work for each key:
 
 - Return the same results as a `get` for each key, with all keys reading from one state view.
 - Share the work that a `get` in a loop repeats. Do the setup once per batch.
-- Never cost more than the loop. A batch read sends no more object store requests than a `get` loop, plus at most one filter load per SST whose filter is not in the cache.
+- Never cost more than the loop. A batch read sends no more object store requests than a `get` loop, plus at most one filter load per SST whose filter is not in the cache. This holds when no other reader loads the same blocks at the same time.
 - Bound the concurrency and memory of one batch.
 
 ## Non-Goals
@@ -234,7 +234,7 @@ pub struct MultiGetOptions {
     /// most this many bytes. With 0, only adjacent blocks merge.
     /// Default: 64 KiB.
     pub coalesce_gap_bytes: usize,
-    /// Upper size of one merged ranged GET. Default: 4 MiB.
+    /// Upper size of one merged ranged GET. Default: 512 KiB.
     pub max_coalesced_bytes: usize,
 }
 ```
@@ -249,6 +249,9 @@ Notes on the fields:
   A workload with long merge chains can raise it to get fewer rounds.
 - Block merging helps when the keys of a batch cluster, for example under one
   prefix. Random keys in a 1 GiB SST almost never share a range.
+- A merged range is one GET under one permit. The blocks in the gaps of a
+  range are read, but they are not decoded or cached. Blocks that no key
+  asked for can push hot blocks out of the cache.
 
 ### Plan phase
 
@@ -362,10 +365,12 @@ run():
 read_sst(sst, keys):                      # a future on the batch task
     index  = load_index(sst)              # cache, or kept in loaded
     blocks = the block of each key, from the index
-    ranges = merge_adjacent(blocks)       # coalesce_gap_bytes
+    ranges = merge_adjacent(the blocks not in the cache)
+                                          # coalesce_gap_bytes
     for range in ranges, all in parallel: # not one after the other
-        data = read range                 # cache, or GET under the
+        data = read range                 # one GET under the
                                           # semaphore: max_fetch_tasks
+        decode and cache the key blocks of range, not the gap blocks
         for key in keys inside range:
             seek the key, collect its entries
 ```
@@ -386,13 +391,16 @@ Why an event loop and not a loop of steps over all keys:
 - The loop spawns no task. Each load and read is a future on the task of
   the batch. A cache hit resolves when the loop polls it, with no I/O.
 
-Two limits of the loop:
+Three limits of the loop:
 
 - Two reads of one SST can overlap, when its keys become ready at different
   times. Each read loads the index when the meta cache has none. A loop of
   gets reads it per key, so goal 3 still holds.
 - The loaded filters and indexes are kept per batch, so a key that reads on
   after another key of the same SST sends no metadata request again.
+- Only a range of one block shares its load with concurrent readers, as
+  `get` does. A range of more blocks does not, which is why goal 3 excludes
+  concurrent readers.
 
 #### How many SSTs a key reads in one round
 
@@ -687,7 +695,8 @@ the same order as for the loop: each key still reads its blocks.
 
 **Requests and cost.** A batch never sends more GETs than a loop of `get`
 on the same snapshot (goal 3), plus at most one filter load per SST with
-no cached filter. A batch sends no LIST and no PUT. Almost every batch of
+no cached filter. This holds when no other reader loads the same blocks at
+the same time. A batch sends no LIST and no PUT. Almost every batch of
 100 keys needs a second round for a few keys, because a bloom filter with
 10 bits per key gives about 1 percent false positives. The event loop
 overlaps that round with the first, so a batch pays about one tail
@@ -943,10 +952,6 @@ spawned task per SST in a `JoinSet`. This was v3 of this RFC.
     bottom run touches about 100 SSTs.
   - Option: drop an index after the last read that needs it, or keep it only
     in the block cache when there is one.
-
-- Do the gap blocks of a merged read go into the block cache?
-  - For: it is a free prefetch for keys that cluster.
-  - Against: blocks that no key asked for can push hot blocks out.
 
 - Does `get` become a `multi_get` of one key later? It is a non-goal here, but
   two read paths cost more to maintain than one. The answer depends on a

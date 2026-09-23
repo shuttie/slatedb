@@ -204,7 +204,14 @@ impl<'a> SstReader<'a> {
             },
             self.options.coalesce_gap_bytes as u64,
             self.options.max_coalesced_bytes as u64,
-        );
+        )
+        .into_iter()
+        .map(|run| {
+            let start = missing.partition_point(|&b| b < run.start);
+            let end = missing.partition_point(|&b| b < run.end);
+            missing[start..end].to_vec()
+        })
+        .collect();
         BlockFetch {
             table_store: self.table_store.clone(),
             requests: self.requests.clone(),
@@ -233,8 +240,9 @@ struct BlockFetch {
     keys: Vec<KeyBlocks>,
     /// The blocks from the cache. The fetched blocks join them.
     blocks: BTreeMap<usize, Arc<Block>>,
-    /// The missing blocks, merged into ranges.
-    runs: Vec<Range<usize>>,
+    /// The missing blocks, grouped by the GET that reads them. A GET reads
+    /// from the first to the last block of its group.
+    runs: Vec<Vec<usize>>,
     /// The SST has filters, for the false positive stats.
     filtered: bool,
 }
@@ -250,20 +258,35 @@ impl BlockFetch {
                 .acquire()
                 .await
                 .expect("the request semaphore is never closed");
-            this.table_store
-                .read_blocks_using_index(
+            let segment = Some(this.sst.segment.clone());
+            if let [block] = run[..] {
+                // One block goes through the single-flight load of the cache.
+                let blocks = this.table_store.read_blocks_using_index(
                     &this.sst.handle,
                     this.index.clone(),
-                    run.clone(),
+                    block..block + 1,
                     this.cache_blocks,
-                    Some(this.sst.segment.clone()),
+                    segment,
+                );
+                return Ok(Vec::from(blocks.await?));
+            }
+            // The blocks between the needed ones are read, but not decoded
+            // or cached, and the cache is not checked again. So a run is
+            // exactly one GET under its permit.
+            this.table_store
+                .read_sparse_blocks(
+                    &this.sst.handle,
+                    &this.index,
+                    run,
+                    this.cache_blocks,
+                    segment,
                 )
                 .await
         }))
         .await?;
         for (run, run_blocks) in self.runs.iter().zip(fetched) {
-            for (offset, block) in run_blocks.into_iter().enumerate() {
-                self.blocks.insert(run.start + offset, block);
+            for (&block_num, block) in run.iter().zip(run_blocks) {
+                self.blocks.insert(block_num, block);
             }
         }
 
@@ -619,6 +642,22 @@ mod tests {
         // One block read. The index and the block of key 0 came from the
         // cache.
         assert_eq!(fx.gets(), 1);
+    }
+
+    /// The run of keys 0 and 40 has the blocks of keys 10, 20 and 30 in
+    /// its gap.
+    #[tokio::test]
+    async fn should_read_a_run_in_one_get_and_not_cache_its_gap() {
+        let fx = fixture(true).await;
+        let no_merge = MultiGetOptions::default().with_coalesce_gap_bytes(0);
+        fx.read(&[10, 30], no_merge.clone()).await;
+        fx.recording.clear();
+
+        fx.read(&[0, 40], MultiGetOptions::default()).await;
+        assert_eq!(fx.gets(), 1);
+
+        fx.read(&[20], no_merge).await;
+        assert_eq!(fx.gets(), 2);
     }
 
     fn fixed_blocks(blocks: Range<usize>) -> Range<u64> {

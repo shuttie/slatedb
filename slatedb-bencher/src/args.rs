@@ -341,7 +341,7 @@ pub(crate) struct MgetArgs {
     #[arg(
         long,
         help = "Upper size of one merged ranged GET.",
-        default_value_t = 4 * 1024 * 1024
+        default_value_t = 512 * 1024
     )]
     pub(crate) max_coalesced_bytes: usize,
 }
