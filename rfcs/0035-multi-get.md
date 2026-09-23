@@ -334,12 +334,13 @@ arrive(sst, keys, found):
         inflight[key][sst] = found entries of key, or none
         # apply the entries newest SST first. An older SST of the pick
         # waits until every newer SST of the pick arrived.
-        for sst in the arrived prefix of inflight[key]:
+        for sst in pop the arrived prefix of inflight[key], while key is open:
             for entry in its entries:
                 if entry.seq > max_seq:
                     continue              # not visible, cannot end the key
                 if entry is a value or a tombstone:
                     results[key] = entry  # done, drop the rest of the pick
+                    inflight[key] = []
                     break
                 if entry is a merge operand:
                     operands[key].push(entry)   # the key needs a base value
