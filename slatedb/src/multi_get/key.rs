@@ -268,6 +268,8 @@ mod tests {
     #[case::operand_keeps_the_limit(&[P, P, P], 0, 4, true, Pick::Read(vec![0]))]
     #[case::not_loaded_is_free(&[N, N, P, P], 0, 4, false, Pick::Load(vec![0, 1]))]
     #[case::all_not_loaded_loads_all(&[N, N, N], 0, 4, false, Pick::Load(vec![0, 1, 2]))]
+    #[case::pass_stops_the_loads(&[P, N, N], 0, 4, false, Pick::Read(vec![0]))]
+    #[case::loads_only_above_the_pass(&[N, P, N], 0, 4, false, Pick::Load(vec![0]))]
     #[case::rejects_count(&[P, R, P, P], 1, 2, false, Pick::Read(vec![0]))]
     #[case::rejects_only_move_on(&[R, R, P, P], 1, 2, false, Pick::Read(vec![2]))]
     #[case::all_rejected(&[R, R], 0, 4, false, Pick::Done)]

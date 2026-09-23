@@ -292,9 +292,9 @@ The reasons behind the steps:
   key is read one time.
 - The plan phase builds no iterators. A `get` builds one iterator per memtable
   and per candidate SST before its first lookup.
-- The plan phase does not look at filters. A `get` checks the filter of an
-  older SST only when the newer SSTs did not answer. A batch that loads all
-  filters up front sends more requests than a loop when the cache is cold.
+- The plan phase loads no filter. It only takes the filters that are in the
+  cache, with no request. A `get` loads the filter of an older SST only when
+  the newer SSTs did not answer, and the read phase does the same.
 - The binary search per key and run is the one that `get` uses. A forward
   pass over sorted keys saves little next to the reads, and it needs a
   second copy of the search.
@@ -478,8 +478,8 @@ The reasons:
   past, then picks again. So a cold batch reads no block of a shadowed
   version. The price is at most one filter load per uncached SST above the
   requests of a `get` loop.
-- A filter in the cache is a load too, but it sends no request. It costs
-  one turn of the event loop before the key reads.
+- A filter in the cache counts as loaded. The plan phase takes it from the
+  cache, so a warm key reads with no extra turn of the event loop.
 - A merge operand does not change the limit, because it does not change the
   walk of `get`. A counter with operands in 10 SSTs takes 4 rounds, as in
   `get`.
@@ -895,8 +895,13 @@ read before the next pick. This was the second version of this RFC.
 #### Load all filters in the plan phase
 
 - For: no filter loads in the read phase, and a simpler `pick_next`.
-- Against: with a cold cache, it sends more requests than a loop and breaks
-  goal 3. RocksDB also probes each filter only when the walk reaches the file.
+- With a cold cache, it sends the same requests as the chosen design. A key
+  then loads the filters of all its candidates before its first read. Both
+  designs stay inside goal 3.
+- Against: with a partly warm cache, it sends more requests. The chosen
+  design loads no filter below the first cached filter that passes the key.
+- Against: each key waits for the slowest filter load of the batch. In the
+  chosen design, a key waits only for the filters of its own candidates.
 
 #### Use cached filters in the plan phase
 
