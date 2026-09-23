@@ -159,6 +159,30 @@ impl ReadTrace {
         }
     }
 
+    /// The span of the filter probes of one SST in a `multi_get` batch. The
+    /// batch records `keys` and `positives` as the probes happen.
+    pub(crate) fn new_evaluate_filters_span(
+        &self,
+        sst_id: SsTableId,
+        sst_level: Option<&SstTraceLevel>,
+    ) -> tracing::Span {
+        if let Some(tracing_options) = self.tracing_options.as_ref() {
+            let sst_id = sst_id.value().to_string();
+            let sst_level = Self::format_sst_level(sst_level);
+            tracing::info_span!(
+                parent: &self.read_span,
+                "slatedb.read.evaluate_filter",
+                trace_id = tracing_options.trace_id.as_str(),
+                sst_id = sst_id.as_str(),
+                sst_level = sst_level.as_str(),
+                keys = tracing::field::Empty,
+                positives = tracing::field::Empty,
+            )
+        } else {
+            tracing::Span::none()
+        }
+    }
+
     pub(crate) fn new_read_index_span(
         &self,
         sst_id: SsTableId,

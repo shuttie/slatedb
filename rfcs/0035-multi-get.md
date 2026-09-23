@@ -739,10 +739,15 @@ Metrics. The model is the write path, which counts batches
   dashboards for point reads do not jump.
 - `multi_get_keys / request_count` gives the mean batch size.
 - `multi_get_rounds / request_count` gives the mean number of rounds of the
-  slowest key of a batch. A value well above 2 is a sign of cold filters, or
-  of a `lookahead` that is too low.
+  slowest key of a batch. A value well above 2 is a sign of false positives,
+  of merge operands, or of a `lookahead` that is too low. A filter load is
+  not a round. Cold filters show in the filter miss counter of the cache.
 - The filter counters (`sst_filter_positive_count` and the others, with
-  `kind="point"`) count one probe per (key, SST) pair, as in `get`.
+  `kind="point"`) count one probe per (key, SST) pair, as in `get`. After
+  its first round, a key probes up to `lookahead` candidates at once, so a
+  batch probes more pairs than `get` does.
+- A cold filter counts two cache misses in a batch: one from the peek of the
+  plan phase, and one from the load.
 
 Tracing. A batch with `tracing_options` opens one `slatedb.read` span, as `get`
 does:
@@ -750,9 +755,9 @@ does:
 - The span gets two new fields: `keys` and `rounds`.
 - `slatedb.read.read_filters` and `slatedb.read.read_index` stay one span per
   SST.
-- `slatedb.read.evaluate_filter` becomes one span per SST with a `keys` field.
-  A `get` opens one such span per key and SST. A batch of 1000 keys over 20
-  SSTs then opened 20,000 spans.
+- `slatedb.read.evaluate_filter` becomes one span per SST with a `keys` field
+  and a `positives` field. A `get` opens one such span per key and SST. A
+  batch of 1000 keys over 20 SSTs then opened 20,000 spans.
 
 The rest:
 

@@ -14,7 +14,7 @@ use crate::db_stats::DbStats;
 use crate::filter_policy::{FilterContext, FilterQuery, NamedFilter};
 use crate::flatbuffer_types::SsTableIndexOwned;
 use crate::manifest::{ManifestCore, Segment};
-use crate::reader::SstTraceLevel;
+use crate::reader::{ReadTrace, SstTraceLevel};
 
 use super::key::KeyRead;
 
@@ -42,6 +42,11 @@ pub(crate) struct BatchSst {
     /// The index after the first read of the batch. It saves a load when the
     /// store has no cache.
     pub(crate) index: Option<Arc<SsTableIndexOwned>>,
+    /// The span of the filter probes, from the first probe on.
+    filter_span: Option<tracing::Span>,
+    /// The keys that the filters checked, and the keys that they passed.
+    probes: u64,
+    positives: u64,
 }
 
 impl BatchSst {
@@ -54,16 +59,21 @@ impl BatchSst {
             },
             filters: Filters::NotLoaded,
             index: None,
+            filter_span: None,
+            probes: 0,
+            positives: 0,
         }
     }
 
     /// Whether the filters pass `key`, or `None` when they are not loaded.
-    /// Records the filter stats, as `get` does.
+    /// Records the filter stats, as `get` does. One span covers all probes
+    /// of the SST, with the counts of the probes and the passes so far.
     pub(crate) fn might_hold(
-        &self,
+        &mut self,
         key: &Bytes,
         filter_context: &Option<FilterContext>,
         db_stats: &DbStats,
+        read_trace: &ReadTrace,
     ) -> Option<bool> {
         let Filters::Loaded(filters) = &self.filters else {
             return None;
@@ -71,12 +81,20 @@ impl BatchSst {
         if filters.is_empty() {
             return Some(true);
         }
+        let span = self.filter_span.get_or_insert_with(|| {
+            read_trace.new_evaluate_filters_span(self.target.handle.id, Some(&self.target.level))
+        });
+        let _guard = span.enter();
         let query = FilterQuery::point(key.clone()).with_context(filter_context.clone());
         let pass = filters.iter().all(|nf| nf.filter.might_match(&query));
         match pass {
             true => db_stats.sst_filter_point_positives.increment(1),
             false => db_stats.sst_filter_point_negatives.increment(1),
         }
+        self.probes += 1;
+        self.positives += u64::from(pass);
+        span.record("keys", self.probes);
+        span.record("positives", self.positives);
         Some(pass)
     }
 
@@ -396,8 +414,12 @@ mod tests {
             Some(keys) => Filters::Loaded(filters_of(&keys)),
         };
         let db_stats = DbStats::new(&MetricsRecorderHelper::noop());
+        let read_trace = ReadTrace::new(None);
 
         let key = Bytes::from_static(b"a");
-        assert_eq!(sst.might_hold(&key, &None, &db_stats), expected);
+        assert_eq!(
+            sst.might_hold(&key, &None, &db_stats, &read_trace),
+            expected
+        );
     }
 }

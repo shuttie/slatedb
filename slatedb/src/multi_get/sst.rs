@@ -82,7 +82,7 @@ pub(crate) struct SstReader<'a> {
     /// Each object store request of the batch holds a permit.
     requests: &'a Arc<Semaphore>,
     pub(crate) options: &'a MultiGetOptions,
-    read_trace: &'a ReadTrace,
+    pub(crate) read_trace: &'a ReadTrace,
     pub(crate) db_stats: &'a DbStats,
 }
 

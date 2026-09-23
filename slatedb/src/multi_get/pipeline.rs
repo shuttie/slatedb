@@ -100,9 +100,10 @@ impl<'a> Pipeline<'a> {
     /// loads, or its SSTs go to `ready`.
     fn schedule(&mut self, u: usize) {
         let (options, db_stats) = (self.reader.options, self.reader.db_stats);
-        let ssts = &self.ssts;
+        let read_trace = self.reader.read_trace;
+        let ssts = &mut self.ssts;
         let pick = self.keys[u].pick(options.lookahead, |sst, key| {
-            ssts[sst].might_hold(key, &options.filter_context, db_stats)
+            ssts[sst].might_hold(key, &options.filter_context, db_stats, read_trace)
         });
         match pick {
             // The key is absent, or it has only merge operands.
