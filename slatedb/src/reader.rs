@@ -2601,6 +2601,39 @@ mod tests {
         Ok(())
     }
 
+    /// A batch opens one filter span per SST, with the count of the keys
+    /// that the filters checked.
+    #[test]
+    fn should_record_one_filter_span_per_sst_for_multi_get() -> Result<(), SlateDBError> {
+        let (test_db_state, reader) = build_span_test_reader();
+        let span_recorder = SpanRecorder::default();
+        let subscriber = tracing_subscriber::registry().with(span_recorder.clone());
+        let trace_id = "multi-get-trace";
+        let options =
+            MultiGetOptions::default().with_tracing_options(Some(TracingOptions::new(trace_id)));
+        // The memtable answers the second key, so only the first one probes.
+        let keys = [b"sst-key".as_ref(), b"memtable-key".as_ref()];
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio_test::block_on(reader.multi_get_with_options(
+                &keys,
+                &options,
+                &test_db_state,
+                None,
+                None,
+            ))
+        })?;
+
+        let span = assert_recorded_read_child_span(
+            &span_recorder,
+            "slatedb.read.evaluate_filter",
+            trace_id,
+        );
+        assert_eq!(span.fields.get("keys").map(String::as_str), Some("1"));
+        assert_eq!(span.fields.get("positives").map(String::as_str), Some("1"));
+        Ok(())
+    }
+
     #[test]
     fn should_record_read_spans_for_scan_with_tracing_options() -> Result<(), SlateDBError> {
         let (test_db_state, reader) = build_span_test_reader();
