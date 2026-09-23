@@ -46,8 +46,8 @@ the same setup, and reads the same filters and indexes again.
 
 - It answers what it can from memory. Then it groups the other keys by the
   SSTs that can hold them.
-- It reads each filter, each index, and each data block at most one time per
-  batch, and it reads all SSTs in parallel.
+- It loads each filter one time per batch, and it reads all SSTs in
+  parallel. Keys that share a block share one read.
 - It reads newest SST first. A key reads an older SST only when the newer
   one did not answer it, and no key waits for the reads of another key. A
   batch takes about one tail latency of the object store, and it sends no
@@ -122,7 +122,7 @@ to repeat this work for each key:
 - Return the same results as a `get` for each key, with all keys reading from one state view.
 - Share the work that a `get` in a loop repeats. Do the setup once per batch.
 - Never cost more than the loop. A batch read sends no more object store requests than a `get` loop, plus at most one filter load per SST whose filter is not in the cache. This holds when no other reader loads the same blocks at the same time.
-- Bound the concurrency and memory of one batch.
+- Bound the object store requests of one batch in flight, and the bytes that those requests hold.
 
 ## Non-Goals
 
@@ -527,8 +527,8 @@ Limits and cleanup:
 `loaded`, the memory of the batch:
 
 - It keeps each filter and index that the batch loaded, until the batch ends.
-- The "one read per SST" rule then does not depend on the block cache. It
-  holds with no cache, and with eviction in the middle of a batch.
+- The "one filter load per SST" rule then does not depend on the block
+  cache. It holds with no cache, and with eviction in the middle of a batch.
 
 ### Value resolution
 
